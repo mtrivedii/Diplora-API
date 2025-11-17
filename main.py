@@ -150,20 +150,20 @@ def read_root():
 
 @app.post("/analyze")
 def analyze_data(request: AnalysisRequest):
-    
+
     print(f"Received request for user: {request.user_id}")
-    
-    if interpreter is None or class_names is None:
-        return {"accepted": False, "error": "AI model is not loaded."}
-    
+
+    # We will skip loading the real model for now
+    # if interpreter is None or "Error" in class_names[0]:
+    #     return {"accepted": False, "error": "AI model or class files are not loaded."}
+
     try:
         with psycopg2.connect(DATABASE_URL) as conn:
             print("✅ DB Connection successful!")
-            
+
             with conn.cursor() as cursor:
-                
-                # --- 1. FETCH DATA ---
-                # This query must match your partitioned table [image_96d7a8.png]
+
+                # --- 1. FETCH DATA (This part is real) ---
                 ecg_query = """
                     SELECT * FROM ecg_data
                     WHERE user_id = %s
@@ -174,38 +174,25 @@ def analyze_data(request: AnalysisRequest):
                 cursor.execute(ecg_query, (request.user_id, request.start, request.end))
                 ecg_results = cursor.fetchall()
                 print(f"Found {len(ecg_results)} ECG rows.")
-                
+
                 if len(ecg_results) == 0:
                     return {"accepted": False, "error": "No ECG data found for this time window."}
-                
-                # --- 2. PREPROCESS DATA ---
-                print("Preprocessing data...")
-                preprocessed_ecg = preprocess_from_db(ecg_results)
-                
-                if preprocessed_ecg is None:
-                    return {"accepted": False, "error": "Failed to preprocess data."}
-                
-                print(f"Data shape for model: {preprocessed_ecg.shape}")
 
-                # --- 3. RUN AI PREDICTION ---
-                print("Running AI inference...")
-                probs, bin_preds = predict(interpreter, input_details, output_details, preprocessed_ecg)
-                
-                # Format the results
-                predictions = {}
-                for i, class_name in enumerate(class_names):
-                    if bin_preds[i] == 1:
-                        predictions[class_name] = float(probs[i])
-                
-                print(f"Predictions: {predictions}")
-                
-                # --- 4. SAVE RESULTS (for Traceability ) ---
+                # --- 2. MOCK AI PREDICTION (This part is fake) ---
+                # We skip preprocessing and prediction
+                print("Running MOCK AI inference...")
+                predictions = {
+                    "AF": 0.95,
+                    "NSR": 0.12
+                }
+                print(f"Mock Predictions: {predictions}")
+
+                # --- 3. SAVE RESULTS (This part is real) ---
                 print("Saving results to database...")
-                
-                # Create the JSON objects for the results table [image_4754dc.png]
+
                 metrics_json = json.dumps({"probabilities": predictions})
                 annotations_json = json.dumps({"labels": list(predictions.keys())})
-                
+
                 insert_query = """
                     INSERT INTO ecg_analysis_results
                     (user_id, start_ts, end_ts, metrics, annotations)
@@ -219,10 +206,10 @@ def analyze_data(request: AnalysisRequest):
                     metrics_json,
                     annotations_json
                 ))
-                
+
                 result_id = cursor.fetchone()[0]
                 print(f"✅ Results saved with ID: {result_id}")
-        
+
         # Return a success response
         return {
             "accepted": True, 
