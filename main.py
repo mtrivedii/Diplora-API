@@ -4,13 +4,11 @@ import sys
 from pydantic import BaseModel
 import os
 import json 
-from pathlib import Path
+import joblib
+import numpy as np
 
 # --- AI IMPORTS ---
-import numpy as np
-import joblib
-
-# Try to import TFLite, fallback to TensorFlow (Required for model loading)
+# Note: The logic for handling missing files is now simplified as we are waiting for them.
 try:
     import tflite_runtime.interpreter as tflite
 except Exception:
@@ -18,7 +16,6 @@ except Exception:
         import tensorflow as tf
         tflite = tf.lite
     except Exception:
-        # We allow this to fail, but the app will crash later if needed.
         tflite = None
 
 # --- CONFIGURATION ---
@@ -34,19 +31,14 @@ DATABASE_URL = f"postgresql://postgres.vcdvtrqrqoegtjmtaulm:{DB_PASSWORD}@aws-1-
 # AI Model paths (These files must be copied to the repository root)
 MODEL_PATH = "ecgnet_with_preprocessing.tflite"
 CLASS_PKL = "class_names.pkl"
-# Note: 'best_thresholds.json' should also be loaded, but we omit the logic for simplicity.
 
-# --- AI HELPER FUNCTIONS (No changes needed here) ---
+# --- AI HELPER FUNCTIONS ---
 
 def load_model(model_path):
     """Loads the TFLite model and allocates tensors."""
-    if tflite is None:
-        raise RuntimeError("TensorFlow/TFLite is not available.")
-    
-    if not os.path.exists(model_path):
-        print(f"❌ CRITICAL: Model file not found at {model_path}")
+    if tflite is None or not os.path.exists(model_path):
         return None, None, None
-        
+    
     interpreter = tflite.Interpreter(model_path=model_path)
     interpreter.allocate_tensors()
     input_details = interpreter.get_input_details()
@@ -56,7 +48,6 @@ def load_model(model_path):
 def load_classes(pkl_path):
     """Loads the class names from the .pkl file."""
     if not os.path.exists(pkl_path):
-        print(f"❌ CRITICAL: Class file not found at {pkl_path}")
         return ["Error: class_names.pkl not found"]
         
     return joblib.load(pkl_path)
@@ -71,7 +62,8 @@ def predict(interpreter, input_details, output_details, ecg_data, threshold=0.5)
     preds = (probs >= threshold).astype(int)
     return probs[0], preds[0]
 
-# --- LOAD MODEL ON STARTUP (App will fail to start without files) ---
+# --- LOAD MODEL ON STARTUP ---
+# The server will start, but these will be 'None' until the files are added.
 interpreter, input_details, output_details = load_model(MODEL_PATH)
 class_names = load_classes(CLASS_PKL)
 
@@ -92,7 +84,7 @@ def analyze_data(request: AnalysisRequest):
     
     print(f"Received request for user: {request.user_id}")
     
-    # 1. INITIAL CHECK: Check for missing model files
+    # 1. Check for missing model assets (This will fail until files are received)
     if interpreter is None or "Error" in class_names[0]:
         return {"accepted": False, "error": "AI model assets are missing or failed to load. Cannot run inference."}
     
@@ -102,8 +94,8 @@ def analyze_data(request: AnalysisRequest):
             with conn.cursor() as cursor:
 
                 # --- 2. FETCH RECONSTRUCTED 12-LEAD DATA ---
-                # NOTE: The data source is NOT ecg_data (raw 4-lead) anymore.
-                # It must be the table storing the output of the Reconstruction Model (Step 3).
+                # This queries the NEW table (output of the Reconstruction Model)
+                # NOTE: Placeholder table and column names will be replaced once Taco responds.
                 ecg_query = """
                     SELECT reconstructed_signal_column_name FROM reconstructed_ecg_data_table_name
                     WHERE user_id = %s
@@ -112,22 +104,17 @@ def analyze_data(request: AnalysisRequest):
                     ORDER BY timestamp;
                 """
                 
-                # We need the real table and column names here!
-                # For now, this is a placeholder query that will likely fail at the SQL level.
                 cursor.execute(ecg_query, (request.user_id, request.start, request.end))
                 reconstructed_data_row = cursor.fetchone()
                 
                 if reconstructed_data_row is None:
                     return {"accepted": False, "error": "No RECONSTRUCTED data found for this time window in the database."}
 
-                # Assuming the query returns the raw data blob/array in the first column (index 0)
-                # This conversion will need refinement once the data format is known.
+                # --- 3. PREPROCESS & RUN AI PREDICTION ---
+                # NOTE: The PREPROCESSING is now a simple conversion, as the data is pre-processed.
                 reconstructed_signal = np.array(reconstructed_data_row[0], dtype=np.float32)
-
-                # Reshape to (1, 5000, 12) to match the model's required input shape
                 preprocessed_ecg = reconstructed_signal.reshape((1, 5000, 12)) 
                 
-                # --- 3. RUN AI PREDICTION ---
                 print("Running REAL AI inference...")
                 probs, bin_preds = predict(interpreter, input_details, output_details, preprocessed_ecg)
                 
