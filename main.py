@@ -4,7 +4,6 @@ import sys
 from pydantic import BaseModel
 import os
 import json 
-import joblib
 import numpy as np
 
 # --- AI IMPORTS ---
@@ -26,10 +25,10 @@ if not DB_PASSWORD:
 
 DATABASE_URL = f"postgresql://postgres.vcdvtrqrqoegtjmtaulm:{DB_PASSWORD}@aws-1-eu-west-1.pooler.supabase.com:5432/postgres"
 
-# Asset paths
+# Files you HAVE (based on your uploads)
 MODEL_PATH = "ecgnet_with_preprocessing.tflite"
-CLASS_JSON = "ecg_labels.json"
-THRESHOLDS_JSON = "best_thresholds.json"
+CLASS_JSON = "ecg_labels.json"       # Replaces class_names.pkl
+THRESHOLDS_JSON = "best_thresholds.json" # For optimized accuracy
 
 # --- AI HELPER FUNCTIONS ---
 
@@ -41,16 +40,21 @@ def load_model(model_path):
     return interpreter, interpreter.get_input_details(), interpreter.get_output_details()
 
 def load_assets(json_path, threshold_path):
-    """Loads class labels and thresholds."""
-    if not os.path.exists(json_path) or not os.path.exists(threshold_path):
-        return ["Error: assets missing"], np.array([0.5])
-    
+    """Loads class labels and thresholds from JSON files."""
+    # 1. Load Labels
+    if not os.path.exists(json_path):
+        return ["Error: ecg_labels.json missing"], None
     with open(json_path, 'r') as f:
-        class_names = json.load(f)
-    
-    with open(threshold_path, 'r') as f:
-        thresholds = np.array(json.load(f))
-        
+        class_names = json.load(f) # Expecting a list ["AF", "NSR", ...]
+
+    # 2. Load Thresholds
+    if not os.path.exists(threshold_path):
+        print("⚠️ Thresholds missing. Using default 0.5.")
+        thresholds = np.array([0.5] * len(class_names))
+    else:
+        with open(threshold_path, 'r') as f:
+            thresholds = np.array(json.load(f))
+            
     return class_names, thresholds
 
 def predict(interpreter, input_details, output_details, ecg_data, thresholds):
@@ -58,7 +62,13 @@ def predict(interpreter, input_details, output_details, ecg_data, thresholds):
     interpreter.invoke()
     logits = interpreter.get_tensor(output_details[0]['index'])
     probs = 1 / (1 + np.exp(-logits)) 
-    bin_preds = (probs[0] >= thresholds).astype(int)
+    
+    # Apply optimized thresholds
+    if thresholds is not None:
+        bin_preds = (probs[0] >= thresholds).astype(int)
+    else:
+        bin_preds = (probs[0] >= 0.5).astype(int)
+        
     return probs[0], bin_preds
 
 # --- STARTUP ---
@@ -87,14 +97,13 @@ def analyze_data(request: AnalysisRequest):
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cursor:
 
-                # --- 1. FETCH RECONSTRUCTED DATA ---
-                # We query the output of the Reconstruction Layer (Diagram 3)
+                # --- 1. FETCH RECONSTRUCTED 12-LEAD DATA ---
+                # TODO: Replace placeholders with real names from Kaximu
                 ecg_query = """
                     SELECT reconstructed_signal_column_name FROM reconstructed_ecg_data_table_name
                     WHERE user_id = %s AND timestamp >= %s AND timestamp < %s
                     ORDER BY timestamp;
                 """
-                # ⚠️ TODO: Replace placeholders above with real table names!
                 
                 cursor.execute(ecg_query, (request.user_id, request.start, request.end))
                 reconstructed_data_row = cursor.fetchone()
@@ -109,27 +118,23 @@ def analyze_data(request: AnalysisRequest):
                 probs, bin_preds = predict(interpreter, input_details, output_details, preprocessed_ecg, best_thresholds)
                 
                 # --- 3. FORMAT OUTPUT (Matching Diagram 3) ---
-                # Diagram 3 requires: prediction, confidence, probabilities, quality
-                
-                # Get the top prediction
                 top_index = np.argmax(probs)
                 primary_prediction = class_names[top_index]
                 confidence_score = float(probs[top_index])
                 
-                # Get all positive detections
                 detailed_probabilities = {}
                 for i, name in enumerate(class_names):
                     if bin_preds[i] == 1:
                         detailed_probabilities[name] = float(probs[i])
 
-                # --- 4. SAVE RESULTS (Traceability) ---
+                # --- 4. SAVE RESULTS ---
                 print("Saving traceable results...")
                 
                 result_payload = {
                     "prediction": primary_prediction,
                     "confidence": confidence_score,
                     "probabilities": detailed_probabilities,
-                    "signal_quality": "good" # Placeholder until quality model is added
+                    "signal_quality": "good" 
                 }
                 
                 insert_query = """
@@ -140,13 +145,12 @@ def analyze_data(request: AnalysisRequest):
                 """
                 cursor.execute(insert_query, (
                     request.user_id, request.start, request.end,
-                    json.dumps(result_payload),  # Save the full structure
+                    json.dumps(result_payload),
                     json.dumps({"labels": list(detailed_probabilities.keys())})
                 ))
                 
                 job_id = cursor.fetchone()[0]
 
-        # Return the Official JSON Structure (Diagram 3)
         return {
             "accepted": True,
             "job_id": str(job_id),
