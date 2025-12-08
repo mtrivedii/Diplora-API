@@ -8,16 +8,20 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from supabase import create_client
 
-# Import your actual model definitions
+# Import your model definitions (ensure these files are in the same folder)
 from neural_net import LeadAwareResNet1D
 from lead_reconstruction import LeadReconstructionNet
 
 # 1. Define the Modal Environment
-# We reuse the requirements from your training setup
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install_from_requirements("requirements.txt")
     .pip_install("supabase")
+    # Add your local model files to the container
+    .add_local_file("neural_net.py", remote_path="/root/neural_net.py")
+    .add_local_file("lead_reconstruction.py", remote_path="/root/lead_reconstruction.py")
+    .add_local_file("signal_processing.py", remote_path="/root/signal_processing.py")
+    .add_local_file("filter.py", remote_path="/root/filter.py")
 )
 
 app = modal.App("diplora-api-production")
@@ -26,156 +30,144 @@ web_app = FastAPI(title="Diplora AI Analysis Service")
 # Mount the volume where your trained weights live
 v_results = modal.Volume.from_name("results")
 
-# 2. Input Data Model (The "Trigger" Payload)
+# 2. Input Data Model
 class AnalysisRequest(BaseModel):
     job_id: str       # UUID for traceability
     record_id: int    # ID of the measurement in Supabase
-    user_id: str      # For permission checks/logging
+    user_id: str      # For permission checks
 
 @app.cls(
     image=image,
-    gpu="T4",  # T4 is perfect for inference (fast & cheap)
+    gpu="T4",  # T4 is cheap and fast enough for inference
     volumes={"/v_results": v_results},
     secrets=[modal.Secret.from_name("diplora-secrets")], # Needs SUPABASE_URL, SUPABASE_KEY, API_SECRET
-    keep_warm=1, # crucial: keeps 1 container ready to respond instantly
-    concurrency_limit=10 # scale up as needed
+    keep_warm=1
 )
 class ModelService:
     def __enter__(self):
-        """
-        Cold Start Initialization: Runs once when container spins up.
-        Loads config and weights so we don't do it per-request.
-        """
+        """Run once on container startup to load models (Cold Start Optimization)"""
         print("⚡ Initializing AI Service...")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # --- A. Load Configuration dynamically ---
-        # We look for the latest run or a specific 'production' folder
-        # For now, let's assume you copy your best run to a fixed path 'model_export_3lead' in the volume
-        # Or we can scan for it. Let's use a fixed path for reliability.
+        # --- A. Load Configuration ---
+        # We look for the folder containing your specific run
+        # Update this if your folder name is different in the Volume!
         model_dir = "/v_results/model_export_3lead" 
         
+        # Fallback: Find latest run if specific folder doesn't exist
         if not os.path.exists(model_dir):
-            # Fallback: try to find the latest timestamped folder
+            print(f"⚠️ '{model_dir}' not found. Scanning for latest run...")
             all_dirs = sorted([d for d in os.listdir("/v_results") if os.path.isdir(os.path.join("/v_results", d))])
             if all_dirs:
                 model_dir = os.path.join("/v_results", all_dirs[-1])
-                print(f"⚠️ Using latest run found: {model_dir}")
         
-        print(f"📂 Loading models from: {model_dir}")
+        print(f"📂 Loading from: {model_dir}")
         
-        # Load Metadata
-        with open(os.path.join(model_dir, "results.json"), "r") as f:
-            self.meta = json.load(f)
+        # Load Metadata to get exact architecture
+        try:
+            with open(os.path.join(model_dir, "results.json"), "r") as f:
+                self.meta = json.load(f)
             
-        arch = self.meta["model_architecture"]["architecture"]
-        self.class_names = self.meta["per_class_metrics"]["class_names"]
-        
+            arch = self.meta["model_architecture"]["architecture"]
+            self.class_names = self.meta["per_class_metrics"]["class_names"]
+            print(f"✅ Config loaded: {len(self.class_names)} classes, Depths: {arch['depths']}")
+        except Exception as e:
+            print(f"❌ Failed to load results.json: {e}")
+            raise e
+
         # --- B. Load Classifier ---
         self.classifier = LeadAwareResNet1D(
             n_leads=arch["num_leads"],
-            num_labels=arch["num_classes"],
-            base=arch["base_channels"],
-            depths=tuple(arch["depths"]),
+            num_labels=arch["num_classes"], # Should be 23
+            base=arch["base_channels"],     # Should be 48
+            depths=tuple(arch["depths"]),   # Should be [3, 6, 12, 4]
             k=arch["kernel_size"],
             p_drop=arch["dropout"],
-            use_lead_mixer=True,   # Explicitly setting based on your config
-            use_rhythm_head=True   # Explicitly setting based on your config
+            use_lead_mixer=True,  # Assuming True based on training
+            use_rhythm_head=True  # Assuming True based on training
         ).to(self.device)
         
-        clf_weights = os.path.join(model_dir, "model_weights.pth")
-        self.classifier.load_state_dict(torch.load(clf_weights, map_location=self.device))
+        clf_path = os.path.join(model_dir, "model_weights.pth")
+        self.classifier.load_state_dict(torch.load(clf_path, map_location=self.device))
         self.classifier.eval()
         
         # --- C. Load Reconstructor ---
-        # (Assuming standard architecture for recon as per lead_reconstruction.py)
         self.recon = LeadReconstructionNet().to(self.device)
-        recon_weights = os.path.join(model_dir, "lead_reconstruction.pth")
-        if os.path.exists(recon_weights):
-            self.recon.load_state_dict(torch.load(recon_weights, map_location=self.device))
+        recon_path = os.path.join(model_dir, "lead_reconstruction.pth")
+        
+        if os.path.exists(recon_path):
+            self.recon.load_state_dict(torch.load(recon_path, map_location=self.device))
             self.recon.eval()
+            print("✅ Reconstruction model loaded")
         else:
-            print("⚠️ Reconstruction weights not found, skipping recon.")
+            print("⚠️ Reconstruction weights not found, skipping.")
             self.recon = None
 
         # --- D. Connect to Supabase ---
         self.supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
-        print("✅ Service Ready & Connected")
 
     def fetch_signal(self, record_id: int):
-        """Fetch raw ECG data from Supabase"""
+        """Fetch raw ECG from Supabase"""
         resp = self.supabase.table("measurements").select("*").eq("id", record_id).execute()
         if not resp.data:
-            raise ValueError(f"Record {record_id} not found")
+            raise ValueError(f"Record {record_id} not found in Supabase")
         
         row = resp.data[0]
         
-        # Convert to numpy [3, 5000] (Lead I, II, V2)
-        # Note: Ensure your DB columns match these keys exactly
+        # Stack leads (ensure DB column names match these!)
+        # Adjust 'lead_i', 'lead_ii' if your DB uses different names
         try:
             sig = np.stack([
-                np.array(row["lead_i"]),
-                np.array(row["lead_ii"]), 
-                np.array(row["lead_v2"])
+                np.array(row.get("lead_i") or row.get("channel1")),
+                np.array(row.get("lead_ii") or row.get("channel2")),
+                np.array(row.get("lead_v2") or row.get("channel3"))
             ])
-        except KeyError:
-            # Fallback if names differ (e.g. channel1, channel2)
-            sig = np.stack([
-                np.array(row.get("channel1", [])),
-                np.array(row.get("channel2", [])), 
-                np.array(row.get("channel3", []))
-            ])
-            
-        # Basic Validation
-        if sig.shape[1] < 100:
-            raise ValueError("Signal too short")
-            
-        # Normalize (Important: Matches training preprocessing)
-        # (x - mean) / std
+        except Exception:
+            raise ValueError("Could not find lead data columns (lead_i/channel1) in record")
+
+        # Normalize (Standardize)
         m = sig.mean(axis=1, keepdims=True)
         s = sig.std(axis=1, keepdims=True) + 1e-8
         sig = (sig - m) / s
         
-        return torch.from_numpy(sig).float().unsqueeze(0) # Add batch dim [1, 3, T]
+        return torch.from_numpy(sig).float().unsqueeze(0) # [1, 3, T]
 
     @modal.web_endpoint(method="POST")
     def analyze(self, request: AnalysisRequest, x_api_key: str = Header(None)):
         """
-        The Secure Endpoint called by Supabase Edge Functions
+        Secure Endpoint: Triggered by Supabase Edge Function
         """
-        # 1. ISO 13485 Security Gate
         if x_api_key != os.environ["API_SECRET"]:
             raise HTTPException(status_code=401, detail="Invalid API Key")
 
         start_time = time.time()
         
         try:
-            # 2. Data Acquisition
+            # 1. Fetch & Preprocess
             x = self.fetch_signal(request.record_id).to(self.device)
             
-            # 3. Inference (Classification)
-            # Create dummy features for rhythm head if needed (batch=1)
-            # Ideally, you'd calculate these real-time using signal_processing.py
-            hrv_dummy = torch.zeros((1, 12)).to(self.device) 
-            age_dummy = torch.tensor([0.5]).to(self.device) # Default normalized age
-            sex_dummy = torch.tensor([0.5]).to(self.device) # Default unknown sex
-            
+            # 2. Inference
+            # Create dummy features for rhythm head (required by model forward pass)
+            hrv_dummy = torch.zeros((1, 12)).to(self.device)
+            age_dummy = torch.tensor([0.5]).to(self.device)
+            sex_dummy = torch.tensor([0.5]).to(self.device)
+
             with torch.no_grad():
                 logits = self.classifier(x, hrv_features=hrv_dummy, age=age_dummy, sex=sex_dummy)
                 probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
                 
-                # Get top prediction
-                top_idx = int(np.argmax(probs))
-                prediction = self.class_names[top_idx]
-                confidence = float(probs[top_idx])
-                
-                # Reconstruction (Optional)
+                # Reconstruction
                 recon_data = None
                 if self.recon:
                     recon_out = self.recon(x)
                     recon_data = recon_out.cpu().numpy()[0].tolist()
 
-            # 4. Traceability Logging (Write back to DB)
+            # 3. Format Results
+            top_idx = int(np.argmax(probs))
+            prediction = self.class_names[top_idx]
+            confidence = float(probs[top_idx])
+            
+            # 4. Traceability: Log to Supabase.pdf]
             payload = {
                 "job_id": request.job_id,
                 "measurement_id": request.record_id,
@@ -187,21 +179,22 @@ class ModelService:
                 "model_version": "v1.0-resnet-23class"
             }
             
+            # Insert into 'analysis_results' table
             self.supabase.table("analysis_results").insert(payload).execute()
             
             return {
                 "status": "success", 
-                "prediction": prediction,
+                "prediction": prediction, 
                 "confidence": confidence
             }
 
         except Exception as e:
-            print(f"❌ Analysis failed: {e}")
-            # Log failure for audit trail
+            print(f"❌ Error: {e}")
+            # Log failure
             self.supabase.table("analysis_results").insert({
-                "job_id": request.job_id,
-                "measurement_id": request.record_id,
-                "status": "failed",
+                "job_id": request.job_id, 
+                "measurement_id": request.record_id, 
+                "status": "failed", 
                 "error_log": str(e)
             }).execute()
             raise HTTPException(status_code=500, detail=str(e))
