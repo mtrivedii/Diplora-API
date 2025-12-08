@@ -20,19 +20,20 @@ load_dotenv()
 # --- CONFIGURATION ---
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY")
-DATABASE_URL = f"postgresql://postgres.vcdvtrqrqoegtjmtaulm:{DB_PASSWORD}@aws-1-eu-west-1.pooler.supabase.com:5432/postgres"
+# Default to empty if not set to prevent string format errors
+DATABASE_URL = f"postgresql://postgres.vcdvtrqrqoegtjmtaulm:{DB_PASSWORD or ''}@aws-1-eu-west-1.pooler.supabase.com:5432/postgres"
 
 # --- HUGGING FACE CONFIG ---
 HF_REPO_ID = "maanit/diplora-demo"
-HF_TOKEN = os.environ.get("HF_TOKEN") # REQUIRED for private repos
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 HF_FILES = {
     "config": "results.json",
-    "classifier": "model_weights.pth",       # <--- UPDATED to match your screenshot
+    "classifier": "model_weights.pth",
     "reconstructor": "lead_reconstruction.pth"
 }
 
-# --- FALLBACK CONFIG (In case results.json is missing) ---
+# --- FALLBACK CONFIG ---
 DEFAULT_ARCH = {
     "n_leads": 3, "num_labels": 23, "base": 48, 
     "depths": (3, 6, 12, 4), "k": 7, 
@@ -58,7 +59,7 @@ def clear_memory():
     gc.collect()
 
 def load_config():
-    """Fetches results.json or falls back to hardcoded defaults"""
+    """Fetches results.json or falls back to defaults"""
     try:
         print("📥 Fetching config from Hugging Face...")
         config_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["config"], token=HF_TOKEN)
@@ -85,14 +86,15 @@ def load_config():
             "params": DEFAULT_ARCH
         }
 
-# Load config immediately
+# Load config immediately (Lightweight JSON)
 CONFIG_DATA = load_config()
 CLASS_NAMES = CONFIG_DATA["class_names"]
 CLF_PARAMS = CONFIG_DATA["params"]
 
 def load_classifier():
-    """Loads classifier from Private HF Repo"""
+    """Loads classifier from Private HF Repo (LAZY LOAD)"""
     print("🧠 Loading Classifier...")
+    # This download happens ONLY when analyze is called
     model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["classifier"], token=HF_TOKEN)
     
     model = LeadAwareResNet1D(**CLF_PARAMS).to(device)
@@ -106,7 +108,7 @@ def load_classifier():
     return model
 
 def load_reconstructor():
-    """Loads reconstructor from Private HF Repo"""
+    """Loads reconstructor from Private HF Repo (LAZY LOAD)"""
     print("🎨 Loading Reconstructor...")
     recon_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["reconstructor"], token=HF_TOKEN)
     
@@ -115,18 +117,9 @@ def load_reconstructor():
     recon.eval()
     return recon
 
-# --- STARTUP ---
-@app.on_event("startup")
-async def startup_event():
-    # Attempt to pre-cache everything on startup
-    print("🚀 Startup: Caching model weights...")
-    try:
-        # We don't need to re-download config, it's done at top level
-        hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["classifier"], token=HF_TOKEN)
-        hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["reconstructor"], token=HF_TOKEN)
-        print("✅ Models cached successfully.")
-    except Exception as e:
-        print(f"❌ Startup Warning: Could not cache models. Will retry on first request. Error: {e}")
+# --- REMOVED STARTUP EVENT TO SAVE MEMORY ---
+# The models will now download automatically the first time /analyze is hit.
+# This keeps the boot process lightweight and prevents OOM crashes.
 
 # --- SECURITY & DATA ---
 async def verify_api_key(key: str = Security(api_key_header)):
@@ -172,7 +165,7 @@ def analyze_data(request: AnalysisRequest):
                 peaks = detect_r_peaks(lead_ii, fs=TARGET_FS)
                 hrv = compute_hrv_features(peaks, fs=TARGET_FS)
 
-                # Inference
+                # Inference (Lazy Load happens here)
                 clf_model = load_classifier()
                 
                 x = torch.from_numpy(signal).unsqueeze(0).to(device)
@@ -184,6 +177,7 @@ def analyze_data(request: AnalysisRequest):
                     logits = clf_model(x, hrv_features=h, age=a, sex=s)
                     probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
                 
+                # UNLOAD MODEL IMMEDIATELY TO SAVE RAM
                 del clf_model
                 clear_memory() 
 

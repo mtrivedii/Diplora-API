@@ -1,3 +1,7 @@
+# Move this to the VERY TOP to ensure CPU version is picked
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
 # Web Server
 fastapi
 uvicorn
@@ -7,12 +11,9 @@ python-dotenv
 requests
 huggingface-hub
 
-# AI Inference (CPU Optimized)
-torch --index-url https://download.pytorch.org/whl/cpu
+# Math & Signal Processing
 numpy
 scipy
-tqdm  
-
-# Signal Processing Dependencies
+tqdm
 PyWavelets
 filterpy
