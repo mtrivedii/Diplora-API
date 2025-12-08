@@ -5,6 +5,7 @@ psycopg2-binary
 pydantic
 python-dotenv
 requests
+huggingface-hub
 
 # AI Inference (CPU Optimized)
 torch --index-url https://download.pytorch.org/whl/cpu

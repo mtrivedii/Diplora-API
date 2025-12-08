@@ -6,9 +6,9 @@ import os
 import json
 import numpy as np
 import torch
-import requests
-import gc # Garbage Collection
+import gc 
 from dotenv import load_dotenv
+from huggingface_hub import hf_hub_download
 
 # --- IMPORT MODULES ---
 from neural_net import LeadAwareResNet1D
@@ -22,31 +22,27 @@ DB_PASSWORD = os.environ.get("DB_PASSWORD")
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY")
 DATABASE_URL = f"postgresql://postgres.vcdvtrqrqoegtjmtaulm:{DB_PASSWORD}@aws-1-eu-west-1.pooler.supabase.com:5432/postgres"
 
-# Model Config
-RESULTS_JSON_PATH = "results.json"
-if os.path.exists(RESULTS_JSON_PATH):
-    with open(RESULTS_JSON_PATH, "r") as f:
-        meta = json.load(f)
-        CLASS_NAMES = meta["per_class_metrics"]["class_names"]
-        arch = meta["model_architecture"]["architecture"]
-        CLF_PARAMS = {
-            "n_leads": arch["num_leads"],
-            "num_labels": arch["num_classes"],
-            "base": arch["base_channels"],
-            "depths": tuple(arch["depths"]),
-            "k": arch["kernel_size"],
-            "use_lead_mixer": True,
-            "use_rhythm_head": True
-        }
-else:
-    # Fallback
-    CLASS_NAMES = ["Error"]
-    CLF_PARAMS = {}
+# --- HUGGING FACE CONFIG ---
+HF_REPO_ID = "maanit/diplora-demo"
+HF_TOKEN = os.environ.get("HF_TOKEN") # REQUIRED for private repos
 
-CLF_MODEL_URL = os.environ.get("CLF_MODEL_URL")
-RECON_MODEL_URL = os.environ.get("RECON_MODEL_URL")
-CLF_PATH = "model_weights.pth"
-RECON_PATH = "lead_reconstruction.pth"
+HF_FILES = {
+    "config": "results.json",
+    "classifier": "model_weights.pth",       # <--- UPDATED to match your screenshot
+    "reconstructor": "lead_reconstruction.pth"
+}
+
+# --- FALLBACK CONFIG (In case results.json is missing) ---
+DEFAULT_ARCH = {
+    "n_leads": 3, "num_labels": 23, "base": 48, 
+    "depths": (3, 6, 12, 4), "k": 7, 
+    "use_lead_mixer": True, "use_rhythm_head": True
+}
+DEFAULT_CLASSES = [
+    "AF", "AFL", "Brady/Escape", "Chamber/axis abnormality", "Fascicular block", 
+    "IVCD-other", "LBBB", "LVH", "NSR", "PR", "PSVT", "PVT", "RBBB", "RVH", 
+    "SA", "SB", "STach", "SVPB/PAC", "SVT", "VBig", "VEB", "VF", "VTach"
+]
 
 # Constants
 TARGET_FS = 500.0
@@ -59,52 +55,78 @@ device = torch.device("cpu")
 
 # --- MEMORY MANAGEMENT ---
 def clear_memory():
-    """Forces garbage collection to free RAM."""
     gc.collect()
 
+def load_config():
+    """Fetches results.json or falls back to hardcoded defaults"""
+    try:
+        print("📥 Fetching config from Hugging Face...")
+        config_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["config"], token=HF_TOKEN)
+        
+        with open(config_path, "r") as f:
+            meta = json.load(f)
+            
+        return {
+            "class_names": meta["per_class_metrics"]["class_names"],
+            "params": {
+                "n_leads": meta["model_architecture"]["architecture"]["num_leads"],
+                "num_labels": meta["model_architecture"]["architecture"]["num_classes"],
+                "base": meta["model_architecture"]["architecture"]["base_channels"],
+                "depths": tuple(meta["model_architecture"]["architecture"]["depths"]),
+                "k": meta["model_architecture"]["architecture"]["kernel_size"],
+                "use_lead_mixer": True,
+                "use_rhythm_head": True
+            }
+        }
+    except Exception as e:
+        print(f"⚠️ Config download failed ({e}). Using FALLBACK defaults.")
+        return {
+            "class_names": DEFAULT_CLASSES,
+            "params": DEFAULT_ARCH
+        }
+
+# Load config immediately
+CONFIG_DATA = load_config()
+CLASS_NAMES = CONFIG_DATA["class_names"]
+CLF_PARAMS = CONFIG_DATA["params"]
+
 def load_classifier():
-    """Loads classifier only when needed."""
-    if not os.path.exists(CLF_PATH):
-        download_file(CLF_MODEL_URL, CLF_PATH)
-    
+    """Loads classifier from Private HF Repo"""
     print("🧠 Loading Classifier...")
+    model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["classifier"], token=HF_TOKEN)
+    
     model = LeadAwareResNet1D(**CLF_PARAMS).to(device)
-    ckpt = torch.load(CLF_PATH, map_location=device)
+    ckpt = torch.load(model_path, map_location=device)
+    
     state_dict = ckpt.get("state_dict", ckpt)
     clean_state = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    
     model.load_state_dict(clean_state, strict=False)
     model.eval()
     return model
 
 def load_reconstructor():
-    """Loads reconstructor only when needed."""
-    if not os.path.exists(RECON_PATH):
-        download_file(RECON_MODEL_URL, RECON_PATH)
-        
+    """Loads reconstructor from Private HF Repo"""
     print("🎨 Loading Reconstructor...")
+    recon_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["reconstructor"], token=HF_TOKEN)
+    
     recon = LeadReconstructionNet().to(device)
-    recon.load_state_dict(torch.load(RECON_PATH, map_location=device))
+    recon.load_state_dict(torch.load(recon_path, map_location=device))
     recon.eval()
     return recon
 
-def download_file(url, dest):
-    if not url or os.path.exists(dest): return
-    print(f"📥 Downloading {dest}...")
-    try:
-        r = requests.get(url, stream=True)
-        if r.status_code == 200:
-            with open(dest, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-    except Exception as e:
-        print(f"Error downloading: {e}")
-
-# --- STARTUP (ONLY DOWNLOAD, DON'T LOAD TO RAM) ---
+# --- STARTUP ---
 @app.on_event("startup")
 async def startup_event():
-    # Only download files to disk. Do NOT load models into RAM yet.
-    download_file(CLF_MODEL_URL, CLF_PATH)
-    download_file(RECON_MODEL_URL, RECON_PATH)
+    # Attempt to pre-cache everything on startup
+    print("🚀 Startup: Caching model weights...")
+    try:
+        # We don't need to re-download config, it's done at top level
+        hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["classifier"], token=HF_TOKEN)
+        hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["reconstructor"], token=HF_TOKEN)
+        print("✅ Models cached successfully.")
+    except Exception as e:
+        print(f"❌ Startup Warning: Could not cache models. Will retry on first request. Error: {e}")
 
 # --- SECURITY & DATA ---
 async def verify_api_key(key: str = Security(api_key_header)):
@@ -138,21 +160,20 @@ class AnalysisRequest(BaseModel):
 @app.post("/analyze", dependencies=[Depends(verify_api_key)])
 def analyze_data(request: AnalysisRequest):
     try:
-        clear_memory() # Free up RAM before starting
+        clear_memory()
         
-        # 1. Fetch Data
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cursor:
                 signal = fetch_and_process_ecg(request.user_id, request.start, request.end, cursor)
                 if signal is None: return {"accepted": False, "error": "No data"}
 
-                # 2. Features
+                # Features
                 lead_ii = signal[1, :]
                 peaks = detect_r_peaks(lead_ii, fs=TARGET_FS)
                 hrv = compute_hrv_features(peaks, fs=TARGET_FS)
 
-                # 3. Load Model -> Inference -> Unload
-                clf_model = load_classifier() # Load just-in-time
+                # Inference
+                clf_model = load_classifier()
                 
                 x = torch.from_numpy(signal).unsqueeze(0).to(device)
                 h = torch.from_numpy(hrv).unsqueeze(0).float().to(device)
@@ -163,7 +184,6 @@ def analyze_data(request: AnalysisRequest):
                     logits = clf_model(x, hrv_features=h, age=a, sex=s)
                     probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
                 
-                # UNLOAD MODEL IMMEDIATELY
                 del clf_model
                 clear_memory() 
 
@@ -172,7 +192,7 @@ def analyze_data(request: AnalysisRequest):
                 conf = float(probs[top_idx])
                 all_probs = {CLASS_NAMES[i]: float(p) for i, p in enumerate(probs)}
 
-                # 4. Audit Log
+                # Audit Log
                 payload = {
                     "type": "classification",
                     "prediction": pred,
@@ -202,7 +222,6 @@ def reconstruct_data(request: AnalysisRequest):
                 signal = fetch_and_process_ecg(request.user_id, request.start, request.end, cursor)
                 if signal is None: return {"accepted": False, "error": "No data"}
 
-                # Load Model -> Inference -> Unload
                 recon_model = load_reconstructor()
                 
                 x = torch.from_numpy(signal).unsqueeze(0).to(device)
@@ -210,7 +229,6 @@ def reconstruct_data(request: AnalysisRequest):
                     out = recon_model(x)
                 recon_data = out.cpu().numpy()[0].tolist()
                 
-                # UNLOAD
                 del recon_model
                 clear_memory()
 
