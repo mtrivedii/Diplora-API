@@ -130,7 +130,7 @@ async def verify_api_key(key: str = Security(api_key_header)):
 def fetch_and_process_ecg(user_id, start, end, cursor):
     query = """
         SELECT COALESCE(channel1,0), COALESCE(channel2,0), COALESCE(channel3,0)
-        FROM ecg_data
+        FROM ecg_data_y2025m09  -- <--- UPDATE THIS NAME
         WHERE user_id = %s AND timestamp >= %s AND timestamp < %s
         ORDER BY timestamp ASC LIMIT 5000;
     """
