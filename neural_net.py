@@ -1,4 +1,4 @@
-"""Simple LeadAwareResNet1D - Minimal architecture for debugging CPU issues"""
+"""Simple LeadAwareResNet1D - Minimal architecture for debugging CPU issue"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
