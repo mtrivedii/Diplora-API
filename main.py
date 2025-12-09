@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Security, Depends, Request
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from pydantic import BaseModel, Field
 import os
 import json
@@ -65,9 +66,9 @@ app = FastAPI(
 # CORS (restrict in production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://yourdomain.com"],  # Lock this down!
+    allow_origins=["*"],  # Allow all for testing
     allow_credentials=True,
-    allow_methods=["POST"],
+    allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
@@ -167,8 +168,7 @@ def compute_input_hash(user_id: str, start: str, end: str) -> str:
     input_str = f"{user_id}|{start}|{end}"
     return hashlib.sha256(input_str.encode()).hexdigest()
 
-def log_audit_event(
-    cursor,
+def log_audit_event_separate(
     job_id: str,
     user_id: str,
     action_type: str,
@@ -179,12 +179,15 @@ def log_audit_event(
     error_message: Optional[str] = None
 ):
     """
-    DELIVERABLE #2: Audit Log Module
-    Sub-Question 3: Audit frameworks for traceability
-    
-    Logs every analysis to audit_logs table (immutable, ISO 13485 compliant)
+    DELIVERABLE #2: Audit Log Module (Separate Connection)
+    Uses its own connection to avoid transaction issues
     """
     try:
+        # Use separate connection with autocommit for audit logs
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        cursor = conn.cursor()
+        
         cursor.execute("""
             INSERT INTO audit_logs (
                 job_id, user_id, action_type, status, 
@@ -196,11 +199,13 @@ def log_audit_event(
             input_hash, json.dumps(output_data), request_ip,
             error_message, MODEL_VERSION
         ))
+        
+        cursor.close()
+        conn.close()
         print(f"✅ Audit log recorded: {job_id} - {action_type} - {status}")
     except Exception as e:
         print(f"❌ CRITICAL: Audit logging failed: {e}")
         # Don't fail the request, but log the error
-        # In production, alert on this!
 
 # --- DATA ACCESS ---
 
@@ -259,6 +264,20 @@ class AnalysisRequest(BaseModel):
 
 # --- ENDPOINTS ---
 
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "service": "Diplora AI Engine",
+        "version": MODEL_VERSION,
+        "status": "online",
+        "endpoints": {
+            "health": "/health",
+            "analyze": "/analyze (POST, requires X-API-Key)",
+            "reconstruct": "/reconstruct (POST, requires X-API-Key)"
+        }
+    }
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring"""
@@ -292,31 +311,51 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
     # SECURITY: Prevent replay attacks (Sub-Q2)
     if job_id in processed_jobs:
         print(f"⚠️ SECURITY: Duplicate job_id detected: {job_id}")
+        
+        # Log replay attack attempt
+        log_audit_event_separate(
+            job_id, request.user_id, "analyze", "failed",
+            input_hash, {"reason": "replay_attack"}, request_ip, 
+            "Duplicate job_id (replay attack prevented)"
+        )
+        
         return {
             "accepted": False, 
             "error": "Duplicate job_id (replay attack prevented)",
             "job_id": job_id
         }
     
+    # Log trigger event (before processing)
+    log_audit_event_separate(
+        job_id, request.user_id, "trigger", "started",
+        input_hash, {}, request_ip
+    )
+    
     try:
         clear_memory()
         
+        # Use separate connection for data fetching
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cursor:
-                # Log trigger event
-                log_audit_event(
-                    cursor, job_id, request.user_id, "trigger", "started",
-                    input_hash, {}, request_ip
-                )
-                
-                # Fetch ECG data
-                signal = fetch_and_process_ecg(request.user_id, request.start, request.end, cursor)
-                if signal is None:
-                    log_audit_event(
-                        cursor, job_id, request.user_id, "analyze", "failed",
-                        input_hash, {}, request_ip, "No ECG data found"
+                # Try to fetch ECG data
+                try:
+                    signal = fetch_and_process_ecg(request.user_id, request.start, request.end, cursor)
+                except Exception as db_error:
+                    # Database error (table doesn't exist, etc.)
+                    error_msg = str(db_error)
+                    
+                    log_audit_event_separate(
+                        job_id, request.user_id, "analyze", "failed",
+                        input_hash, {"error_type": "database"}, request_ip, error_msg
                     )
-                    conn.commit()
+                    
+                    return {"accepted": False, "error": f"Database error: {error_msg}", "job_id": job_id}
+                
+                if signal is None:
+                    log_audit_event_separate(
+                        job_id, request.user_id, "analyze", "failed",
+                        input_hash, {"error_type": "no_data"}, request_ip, "No ECG data found"
+                    )
                     return {"accepted": False, "error": "No data", "job_id": job_id}
 
                 # Features
@@ -360,18 +399,17 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
                     (request.user_id, request.start, request.end, json.dumps(output_data), json.dumps(list(all_probs.keys())))
                 )
                 result_id = cursor.fetchone()[0]
-                
-                # Log successful completion to audit table
-                log_audit_event(
-                    cursor, job_id, request.user_id, "analyze", "completed",
-                    input_hash, output_data, request_ip
-                )
-                
                 conn.commit()
                 
                 # Mark job as processed (replay protection)
                 processed_jobs.add(job_id)
                 
+        # Log successful completion (after everything is done)
+        log_audit_event_separate(
+            job_id, request.user_id, "analyze", "completed",
+            input_hash, output_data, request_ip
+        )
+        
         return {
             "accepted": True,
             "job_id": job_id,
@@ -385,17 +423,11 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
         clear_memory()
         print(f"❌ Error in /analyze: {e}")
         
-        # Log failure to audit
-        try:
-            with psycopg2.connect(DATABASE_URL) as conn:
-                with conn.cursor() as cursor:
-                    log_audit_event(
-                        cursor, job_id, request.user_id, "analyze", "failed",
-                        input_hash, {}, request_ip, str(e)
-                    )
-                    conn.commit()
-        except Exception as audit_err:
-            print(f"❌ Failed to log error to audit: {audit_err}")
+        # Log failure
+        log_audit_event_separate(
+            job_id, request.user_id, "analyze", "failed",
+            input_hash, {}, request_ip, str(e)
+        )
         
         return {"accepted": False, "error": str(e), "job_id": job_id}
 
@@ -409,79 +441,34 @@ async def reconstruct_data(request: AnalysisRequest, http_request: Request):
     input_hash = compute_input_hash(request.user_id, request.start, request.end)
     
     if job_id in processed_jobs:
+        log_audit_event_separate(
+            job_id, request.user_id, "reconstruct", "failed",
+            input_hash, {"reason": "replay_attack"}, request_ip,
+            "Duplicate job_id"
+        )
         return {"accepted": False, "error": "Duplicate job_id", "job_id": job_id}
+    
+    log_audit_event_separate(
+        job_id, request.user_id, "reconstruct", "started",
+        input_hash, {}, request_ip
+    )
     
     try:
         clear_memory()
         
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cursor:
-                log_audit_event(
-                    cursor, job_id, request.user_id, "reconstruct", "started",
-                    input_hash, {}, request_ip
-                )
+                try:
+                    signal = fetch_and_process_ecg(request.user_id, request.start, request.end, cursor)
+                except Exception as db_error:
+                    error_msg = str(db_error)
+                    log_audit_event_separate(
+                        job_id, request.user_id, "reconstruct", "failed",
+                        input_hash, {}, request_ip, error_msg
+                    )
+                    return {"accepted": False, "error": f"Database error: {error_msg}", "job_id": job_id}
                 
-                signal = fetch_and_process_ecg(request.user_id, request.start, request.end, cursor)
                 if signal is None:
-                    log_audit_event(
-                        cursor, job_id, request.user_id, "reconstruct", "failed",
+                    log_audit_event_separate(
+                        job_id, request.user_id, "reconstruct", "failed",
                         input_hash, {}, request_ip, "No data"
-                    )
-                    conn.commit()
-                    return {"accepted": False, "error": "No data", "job_id": job_id}
-
-                recon_model = load_reconstructor()
-                
-                x = torch.from_numpy(signal).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    out = recon_model(x)
-                recon_data = out.cpu().numpy()[0].tolist()
-                
-                del recon_model
-                clear_memory()
-
-                output_data = {
-                    "type": "reconstruction",
-                    "status": "success",
-                    "leads_generated": 12
-                }
-
-                cursor.execute(
-                    "INSERT INTO ecg_analysis_results (user_id, start_ts, end_ts, metrics) VALUES (%s, %s, %s, %s) RETURNING id",
-                    (request.user_id, request.start, request.end, json.dumps(output_data))
-                )
-                result_id = cursor.fetchone()[0]
-                
-                log_audit_event(
-                    cursor, job_id, request.user_id, "reconstruct", "completed",
-                    input_hash, output_data, request_ip
-                )
-                
-                conn.commit()
-                processed_jobs.add(job_id)
-
-        return {
-            "accepted": True,
-            "job_id": job_id,
-            "result_id": result_id,
-            "reconstruction": recon_data
-        }
-
-    except Exception as e:
-        clear_memory()
-        try:
-            with psycopg2.connect(DATABASE_URL) as conn:
-                with conn.cursor() as cursor:
-                    log_audit_event(
-                        cursor, job_id, request.user_id, "reconstruct", "failed",
-                        input_hash, {}, request_ip, str(e)
-                    )
-                    conn.commit()
-        except:
-            pass
-        
-        return {"accepted": False, "error": str(e), "job_id": job_id}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
