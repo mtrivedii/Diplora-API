@@ -244,9 +244,7 @@ def fetch_and_process_ecg(user_id, start, end, cursor):
 # --- PYDANTIC MODELS (Enhanced Validation) ---
 
 class AnalysisRequest(BaseModel):
-    """
-    Enhanced request model with validation
-    """
+    """Enhanced request model with validation"""
     job_id: str = Field(..., description="Unique job identifier from Edge Function")
     user_id: str = Field(..., min_length=1, max_length=100)
     start: str = Field(..., description="Start timestamp (ISO format)")
@@ -472,3 +470,55 @@ async def reconstruct_data(request: AnalysisRequest, http_request: Request):
                     log_audit_event_separate(
                         job_id, request.user_id, "reconstruct", "failed",
                         input_hash, {}, request_ip, "No data"
+                    )
+                    return {"accepted": False, "error": "No data", "job_id": job_id}
+
+                recon_model = load_reconstructor()
+                
+                x = torch.from_numpy(signal).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    out = recon_model(x)
+                recon_data = out.cpu().numpy()[0].tolist()
+                
+                del recon_model
+                clear_memory()
+
+                output_data = {
+                    "type": "reconstruction",
+                    "status": "success",
+                    "leads_generated": 12
+                }
+
+                cursor.execute(
+                    "INSERT INTO ecg_analysis_results (user_id, start_ts, end_ts, metrics) VALUES (%s, %s, %s, %s) RETURNING id",
+                    (request.user_id, request.start, request.end, json.dumps(output_data))
+                )
+                result_id = cursor.fetchone()[0]
+                conn.commit()
+                
+                processed_jobs.add(job_id)
+
+        log_audit_event_separate(
+            job_id, request.user_id, "reconstruct", "completed",
+            input_hash, output_data, request_ip
+        )
+
+        return {
+            "accepted": True,
+            "job_id": job_id,
+            "result_id": result_id,
+            "reconstruction": recon_data
+        }
+
+    except Exception as e:
+        clear_memory()
+        log_audit_event_separate(
+            job_id, request.user_id, "reconstruct", "failed",
+            input_hash, {}, request_ip, str(e)
+        )
+        
+        return {"accepted": False, "error": str(e), "job_id": job_id}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
