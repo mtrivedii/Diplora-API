@@ -50,11 +50,12 @@ TARGET_FS = 500.0
 BP_LOW = 0.5
 BP_HIGH = 40.0
 
+# --- APP SETUP ---
 app = FastAPI()
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 device = torch.device("cpu")
 
-# --- MEMORY MANAGEMENT ---
+# --- CORE HELPERS (Model Loading & Config) ---
 def clear_memory():
     """Forces garbage collection to free RAM."""
     gc.collect()
@@ -87,7 +88,7 @@ def load_config():
             "params": DEFAULT_ARCH
         }
 
-# Load config immediately (Lightweight JSON)
+# Load config immediately (Executes only once on import)
 CONFIG_DATA = load_config()
 CLASS_NAMES = CONFIG_DATA["class_names"]
 CLF_PARAMS = CONFIG_DATA["params"]
@@ -117,30 +118,32 @@ def load_reconstructor():
     recon.eval()
     return recon
 
-# --- DYNAMIC TABLE LOOKUP ---
+# --- DYNAMIC LOGIC & DATA ACCESS (MOVED UP) ---
+
+async def verify_api_key(key: str = Security(api_key_header)):
+    """API Key verification function for endpoint dependencies."""
+    if not API_SECRET_KEY: return True
+    if key == API_SECRET_KEY: return True
+    raise HTTPException(status_code=403, detail="Invalid API Key")
+
 def get_partition_name(timestamp_str):
-    """
-    Parses the timestamp string from the API request and constructs the expected 
-    PostgreSQL partition table name (e.g., ecg_data_y2025m09).
-    """
+    """Parses timestamp string to construct the partition table name."""
     try:
-        # Assuming the request uses the format 'YYYY-MM-DD HH:MM:SS'
+        # Assumes format 'YYYY-MM-DD HH:MM:SS' 
         dt = datetime.strptime(timestamp_str.split('.')[0], "%Y-%m-%d %H:%M:%S")
         return f"ecg_data_y{dt.strftime('%Y')}m{dt.strftime('%m')}"
     except ValueError:
-        # Fallback if parsing fails (e.g., if the user provides an invalid start time)
-        # We default to the primary table name, which will likely still fail but is safe.
+        # Fallback if parsing fails
         return "ecg_data"
 
 def fetch_and_process_ecg(user_id, start, end, cursor):
+    """Fetches data using the dynamically generated partition name."""
     
-    # 1. Dynamically get the table name
     table_name = get_partition_name(start)
     
-    # 2. Use an f-string to inject the table name directly into the SQL query
     query = f"""
         SELECT COALESCE(channel1,0), COALESCE(channel2,0), COALESCE(channel3,0)
-        FROM {table_name}
+        FROM {table_name} 
         WHERE user_id = %s AND timestamp >= %s AND timestamp < %s
         ORDER BY timestamp ASC LIMIT 5000;
     """
@@ -150,7 +153,6 @@ def fetch_and_process_ecg(user_id, start, end, cursor):
     
     if not rows: return None
 
-    # ... rest of the function for processing data ...
     raw = np.array(rows, dtype=np.float32).T 
     filtered = Signal._bp_filter_np(raw, fs=TARGET_FS, lowcut=BP_LOW, highcut=BP_HIGH)
     if filtered.shape[1] < 5000:
@@ -158,7 +160,20 @@ def fetch_and_process_ecg(user_id, start, end, cursor):
         filtered = np.concatenate([filtered, pad], axis=1)
     return filtered[:, :5000]
 
-# --- ENDPOINTS (remain unchanged) ---
+# --- STARTUP EVENT (for caching model files) ---
+@app.on_event("startup")
+async def startup_event():
+    print("🚀 Startup: Ensuring model weights are cached...")
+    try:
+        # Pre-cache main files using the token
+        hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["config"], token=HF_TOKEN)
+        hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["classifier"], token=HF_TOKEN)
+        hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["reconstructor"], token=HF_TOKEN)
+        print("✅ Models cached successfully.")
+    except Exception as e:
+        print(f"❌ Startup Warning: Could not cache models. Will retry on first request. Error: {e}")
+
+# --- ENDPOINTS ---
 class AnalysisRequest(BaseModel):
     user_id: str
     start: str
