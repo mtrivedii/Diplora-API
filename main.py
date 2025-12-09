@@ -9,6 +9,7 @@ import torch
 import gc 
 from dotenv import load_dotenv
 from huggingface_hub import hf_hub_download
+from datetime import datetime # <-- NEW: Used for parsing timestamps
 
 # --- IMPORT MODULES ---
 from neural_net import LeadAwareResNet1D
@@ -20,7 +21,6 @@ load_dotenv()
 # --- CONFIGURATION ---
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY")
-# Default to empty if not set to prevent string format errors
 DATABASE_URL = f"postgresql://postgres.vcdvtrqrqoegtjmtaulm:{DB_PASSWORD or ''}@aws-1-eu-west-1.pooler.supabase.com:5432/postgres"
 
 # --- HUGGING FACE CONFIG ---
@@ -56,6 +56,7 @@ device = torch.device("cpu")
 
 # --- MEMORY MANAGEMENT ---
 def clear_memory():
+    """Forces garbage collection to free RAM."""
     gc.collect()
 
 def load_config():
@@ -94,7 +95,6 @@ CLF_PARAMS = CONFIG_DATA["params"]
 def load_classifier():
     """Loads classifier from Private HF Repo (LAZY LOAD)"""
     print("🧠 Loading Classifier...")
-    # This download happens ONLY when analyze is called
     model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["classifier"], token=HF_TOKEN)
     
     model = LeadAwareResNet1D(**CLF_PARAMS).to(device)
@@ -117,26 +117,40 @@ def load_reconstructor():
     recon.eval()
     return recon
 
-# --- REMOVED STARTUP EVENT TO SAVE MEMORY ---
-# The models will now download automatically the first time /analyze is hit.
-# This keeps the boot process lightweight and prevents OOM crashes.
-
-# --- SECURITY & DATA ---
-async def verify_api_key(key: str = Security(api_key_header)):
-    if not API_SECRET_KEY: return True
-    if key == API_SECRET_KEY: return True
-    raise HTTPException(status_code=403, detail="Invalid API Key")
+# --- DYNAMIC TABLE LOOKUP ---
+def get_partition_name(timestamp_str):
+    """
+    Parses the timestamp string from the API request and constructs the expected 
+    PostgreSQL partition table name (e.g., ecg_data_y2025m09).
+    """
+    try:
+        # Assuming the request uses the format 'YYYY-MM-DD HH:MM:SS'
+        dt = datetime.strptime(timestamp_str.split('.')[0], "%Y-%m-%d %H:%M:%S")
+        return f"ecg_data_y{dt.strftime('%Y')}m{dt.strftime('%m')}"
+    except ValueError:
+        # Fallback if parsing fails (e.g., if the user provides an invalid start time)
+        # We default to the primary table name, which will likely still fail but is safe.
+        return "ecg_data"
 
 def fetch_and_process_ecg(user_id, start, end, cursor):
-    query = """
+    
+    # 1. Dynamically get the table name
+    table_name = get_partition_name(start)
+    
+    # 2. Use an f-string to inject the table name directly into the SQL query
+    query = f"""
         SELECT COALESCE(channel1,0), COALESCE(channel2,0), COALESCE(channel3,0)
-        FROM ecg_data
+        FROM {table_name}
         WHERE user_id = %s AND timestamp >= %s AND timestamp < %s
         ORDER BY timestamp ASC LIMIT 5000;
     """
+    
     cursor.execute(query, (user_id, start, end))
     rows = cursor.fetchall()
+    
     if not rows: return None
+
+    # ... rest of the function for processing data ...
     raw = np.array(rows, dtype=np.float32).T 
     filtered = Signal._bp_filter_np(raw, fs=TARGET_FS, lowcut=BP_LOW, highcut=BP_HIGH)
     if filtered.shape[1] < 5000:
@@ -144,7 +158,7 @@ def fetch_and_process_ecg(user_id, start, end, cursor):
         filtered = np.concatenate([filtered, pad], axis=1)
     return filtered[:, :5000]
 
-# --- ENDPOINTS ---
+# --- ENDPOINTS (remain unchanged) ---
 class AnalysisRequest(BaseModel):
     user_id: str
     start: str
@@ -165,7 +179,7 @@ def analyze_data(request: AnalysisRequest):
                 peaks = detect_r_peaks(lead_ii, fs=TARGET_FS)
                 hrv = compute_hrv_features(peaks, fs=TARGET_FS)
 
-                # Inference (Lazy Load happens here)
+                # Inference
                 clf_model = load_classifier()
                 
                 x = torch.from_numpy(signal).unsqueeze(0).to(device)
