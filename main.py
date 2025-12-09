@@ -9,7 +9,7 @@ import torch
 import gc 
 from dotenv import load_dotenv
 from huggingface_hub import hf_hub_download
-from datetime import datetime # <-- NEW: Used for parsing timestamps
+from datetime import datetime 
 
 # --- IMPORT MODULES ---
 from neural_net import LeadAwareResNet1D
@@ -94,8 +94,9 @@ CLASS_NAMES = CONFIG_DATA["class_names"]
 CLF_PARAMS = CONFIG_DATA["params"]
 
 def load_classifier():
-    """Loads classifier from Private HF Repo (LAZY LOAD)"""
+    """Loads classifier from Private HF Repo (LAZY LOAD - triggers download)"""
     print("🧠 Loading Classifier...")
+    # This downloads the file to the cache if it doesn't exist.
     model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["classifier"], token=HF_TOKEN)
     
     model = LeadAwareResNet1D(**CLF_PARAMS).to(device)
@@ -109,7 +110,7 @@ def load_classifier():
     return model
 
 def load_reconstructor():
-    """Loads reconstructor from Private HF Repo (LAZY LOAD)"""
+    """Loads reconstructor from Private HF Repo (LAZY LOAD - triggers download)"""
     print("🎨 Loading Reconstructor...")
     recon_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["reconstructor"], token=HF_TOKEN)
     
@@ -118,7 +119,7 @@ def load_reconstructor():
     recon.eval()
     return recon
 
-# --- DYNAMIC LOGIC & DATA ACCESS (MOVED UP) ---
+# --- DYNAMIC LOGIC & DATA ACCESS ---
 
 async def verify_api_key(key: str = Security(api_key_header)):
     """API Key verification function for endpoint dependencies."""
@@ -129,11 +130,9 @@ async def verify_api_key(key: str = Security(api_key_header)):
 def get_partition_name(timestamp_str):
     """Parses timestamp string to construct the partition table name."""
     try:
-        # Assumes format 'YYYY-MM-DD HH:MM:SS' 
         dt = datetime.strptime(timestamp_str.split('.')[0], "%Y-%m-%d %H:%M:%S")
         return f"ecg_data_y{dt.strftime('%Y')}m{dt.strftime('%m')}"
     except ValueError:
-        # Fallback if parsing fails
         return "ecg_data"
 
 def fetch_and_process_ecg(user_id, start, end, cursor):
@@ -159,19 +158,6 @@ def fetch_and_process_ecg(user_id, start, end, cursor):
         pad = np.zeros((3, 5000 - filtered.shape[1]), dtype=np.float32)
         filtered = np.concatenate([filtered, pad], axis=1)
     return filtered[:, :5000]
-
-# --- STARTUP EVENT (for caching model files) ---
-@app.on_event("startup")
-async def startup_event():
-    print("🚀 Startup: Ensuring model weights are cached...")
-    try:
-        # Pre-cache main files using the token
-        hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["config"], token=HF_TOKEN)
-        hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["classifier"], token=HF_TOKEN)
-        hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["reconstructor"], token=HF_TOKEN)
-        print("✅ Models cached successfully.")
-    except Exception as e:
-        print(f"❌ Startup Warning: Could not cache models. Will retry on first request. Error: {e}")
 
 # --- ENDPOINTS ---
 class AnalysisRequest(BaseModel):
