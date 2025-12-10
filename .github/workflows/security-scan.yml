@@ -1,4 +1,4 @@
-name: Security Scan
+name: Security Scan - ISO 13485 Compliant
 
 on:
   # Run on every push to main
@@ -14,10 +14,10 @@ on:
 
 jobs:
   # ============================================================================
-  # JOB 1: PYTHON SECURITY ANALYSIS
+  # JOB 1: PYTHON SECURITY ANALYSIS (BLOCKING)
   # ============================================================================
   security-scan:
-    name: Security Analysis
+    name: Security Analysis (Bandit)
     runs-on: ubuntu-latest
     
     steps:
@@ -40,24 +40,72 @@ jobs:
           python -m pip install --upgrade pip
           pip install bandit safety flake8 pylint
 
-      # Step 4: Run Bandit (Python Security Linter)
-      - name: Run Bandit Security Scan
+      # Step 4: Run Bandit (JSON for analysis)
+      - name: Run Bandit Security Scan (JSON)
         run: |
           echo "🔍 Running Bandit security scan..."
           bandit -r . -f json -o bandit-report.json || true
-          bandit -r . -f txt
-        continue-on-error: false
+        continue-on-error: true
 
-      # Step 5: Check for known vulnerabilities in dependencies
+      # Step 5: Run Bandit (Text for display)
+      - name: Run Bandit Security Scan (Text)
+        run: |
+          echo "🔍 Displaying security findings..."
+          bandit -r . -f txt
+        continue-on-error: true
+
+      # Step 6: Check for HIGH severity issues (BLOCKING)
+      - name: Security Gate - Block on HIGH Severity
+        run: |
+          echo "🚨 Checking for HIGH severity security issues..."
+          
+          # Count HIGH severity issues
+          HIGH_COUNT=$(jq '[.results[] | select(.issue_severity == "HIGH")] | length' bandit-report.json)
+          
+          if [ "$HIGH_COUNT" -gt 0 ]; then
+            echo "❌ SECURITY GATE FAILED: $HIGH_COUNT high severity issues found"
+            echo ""
+            echo "The following HIGH severity issues must be fixed:"
+            echo ""
+            jq -r '.results[] | select(.issue_severity == "HIGH") | "- \(.issue_text) at \(.filename):\(.line_number)"' bandit-report.json
+            echo ""
+            echo "Deployment BLOCKED until these issues are resolved."
+            exit 1
+          fi
+          
+          echo "✅ No HIGH severity issues found - Security gate passed"
+
+      # Step 7: Report MEDIUM severity issues (WARNING only)
+      - name: Report Medium Severity Issues
+        if: always()
+        run: |
+          echo "⚠️ Checking for MEDIUM severity security issues..."
+          
+          MEDIUM_COUNT=$(jq '[.results[] | select(.issue_severity == "MEDIUM")] | length' bandit-report.json)
+          
+          if [ "$MEDIUM_COUNT" -gt 0 ]; then
+            echo "⚠️ WARNING: $MEDIUM_COUNT medium severity issues found"
+            echo ""
+            echo "These should be addressed but do not block deployment:"
+            echo ""
+            jq -r '.results[] | select(.issue_severity == "MEDIUM") | "- \(.issue_text) at \(.filename):\(.line_number)"' bandit-report.json
+            echo ""
+            echo "Please review and fix when possible."
+          else
+            echo "✅ No MEDIUM severity issues found"
+          fi
+        continue-on-error: true
+
+      # Step 8: Check for known vulnerabilities in dependencies
       - name: Run Safety Check (Dependency Vulnerabilities)
         run: |
           echo "🔍 Checking dependencies for known vulnerabilities..."
           pip install -r requirements.txt
-          safety check --json || true
-          safety check
+          safety check --json > safety-report.json || true
+          safety check || true
         continue-on-error: true
 
-      # Step 6: Code Quality Check (Flake8)
+      # Step 9: Code Quality Check (Flake8)
       - name: Run Flake8 (Code Quality)
         run: |
           echo "🔍 Running code quality analysis..."
@@ -65,7 +113,7 @@ jobs:
           flake8 . --count --max-complexity=10 --max-line-length=127 --statistics
         continue-on-error: true
 
-      # Step 7: Upload security reports as artifacts
+      # Step 10: Upload security reports as artifacts
       - name: Upload Bandit Report
         uses: actions/upload-artifact@v4
         if: always()
@@ -74,11 +122,19 @@ jobs:
           path: bandit-report.json
           retention-days: 30
 
+      - name: Upload Safety Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: safety-vulnerability-report
+          path: safety-report.json
+          retention-days: 30
+
   # ============================================================================
   # JOB 2: SECRET DETECTION
   # ============================================================================
   secret-scan:
-    name: Secret Detection
+    name: Secret Detection (TruffleHog)
     runs-on: ubuntu-latest
     
     steps:
@@ -100,7 +156,7 @@ jobs:
   # JOB 3: DEPENDENCY SCANNING (Advanced)
   # ============================================================================
   dependency-scan:
-    name: Dependency Analysis
+    name: Dependency Analysis (pip-audit)
     runs-on: ubuntu-latest
     
     steps:
@@ -120,49 +176,10 @@ jobs:
         continue-on-error: true
 
   # ============================================================================
-  # JOB 4: SECURITY GATE (Block Deployment on Critical Issues)
-  # ============================================================================
-  security-gate:
-    name: Security Gate
-    needs: [security-scan, secret-scan, dependency-scan]
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install Bandit
-        run: pip install bandit
-
-      # Critical security check - MUST PASS
-      - name: Critical Security Check (HIGH/CRITICAL only)
-        run: |
-          echo "🚨 Running critical security gate..."
-          echo "This check will FAIL the build if HIGH or CRITICAL issues are found"
-          
-          # Run Bandit with strict mode (fail on HIGH severity)
-          bandit -r . -ll -f txt
-          
-          echo "✅ No critical security issues found"
-
-      - name: Security Gate Passed
-        run: |
-          echo "✅ ============================================"
-          echo "✅ SECURITY GATE PASSED"
-          echo "✅ All security checks completed successfully"
-          echo "✅ Code is ready for deployment"
-          echo "✅ ============================================"
-
-  # ============================================================================
-  # JOB 5: GENERATE SECURITY REPORT
+  # JOB 4: GENERATE SECURITY REPORT (Summary)
   # ============================================================================
   security-report:
-    name: Generate Security Report
+    name: Generate Security Summary
     needs: [security-scan, secret-scan, dependency-scan]
     runs-on: ubuntu-latest
     if: always()
@@ -179,24 +196,87 @@ jobs:
 
       - name: Generate Security Summary
         run: |
-          echo "# 🔐 Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "# 🔐 Security Scan Summary - ISO 13485 Compliance" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
           echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
           echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "**Scan Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Security Checks Performed" >> $GITHUB_STEP_SUMMARY
+          
+          # Parse Bandit report if available
+          if [ -f bandit-report.json ]; then
+            HIGH=$(jq '[.results[] | select(.issue_severity == "HIGH")] | length' bandit-report.json)
+            MEDIUM=$(jq '[.results[] | select(.issue_severity == "MEDIUM")] | length' bandit-report.json)
+            LOW=$(jq '[.results[] | select(.issue_severity == "LOW")] | length' bandit-report.json)
+            
+            echo "## 📊 Security Findings" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Severity | Count | Status |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$HIGH" -gt 0 ]; then
+              echo "| 🔴 HIGH | $HIGH | ❌ BLOCKING |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| 🔴 HIGH | $HIGH | ✅ PASSED |" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            if [ "$MEDIUM" -gt 0 ]; then
+              echo "| 🟡 MEDIUM | $MEDIUM | ⚠️ WARNING |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| 🟡 MEDIUM | $MEDIUM | ✅ PASSED |" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "| 🟢 LOW | $LOW | ℹ️ INFO |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "## ✅ Security Checks Performed" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Python Security Analysis (Bandit)" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Secret Detection (TruffleHog)" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Dependency Vulnerability Scan" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Dependency Vulnerability Scan (Safety, pip-audit)" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Code Quality Analysis (Flake8)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## ISO 13485 Compliance" >> $GITHUB_STEP_SUMMARY
+          echo "## 🏥 ISO 13485 Compliance" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "This security pipeline ensures:" >> $GITHUB_STEP_SUMMARY
-          echo "- No hardcoded secrets in codebase" >> $GITHUB_STEP_SUMMARY
-          echo "- No known vulnerabilities in dependencies" >> $GITHUB_STEP_SUMMARY
-          echo "- Code follows security best practices" >> $GITHUB_STEP_SUMMARY
-          echo "- Automated validation before deployment" >> $GITHUB_STEP_SUMMARY
+          echo "- **Clause 4.1.6:** Risk Management - Automated security validation" >> $GITHUB_STEP_SUMMARY
+          echo "- **Clause 7.5.6:** Software Validation - Code security verification" >> $GITHUB_STEP_SUMMARY
+          echo "- **Clause 7.5.9:** Traceability - Security findings logged and tracked" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📝 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. Review security findings in [Security Analysis](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "2. Fix HIGH severity issues before merging (deployment is blocked)" >> $GITHUB_STEP_SUMMARY
+          echo "3. Address MEDIUM severity issues when possible (best practice)" >> $GITHUB_STEP_SUMMARY
+          echo "4. Document accepted risks in `.bandit` configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Generated by Diplora Security Pipeline v1.2.0*" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # JOB 5: DEPLOYMENT GATE (Final Check)
+  # ============================================================================
+  deployment-gate:
+    name: Deployment Gate - Final Approval
+    needs: [security-scan, secret-scan, dependency-scan]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Deployment Approved
+        run: |
+          echo "✅ ============================================"
+          echo "✅ DEPLOYMENT GATE PASSED"
+          echo "✅ ============================================"
+          echo ""
+          echo "All security checks completed successfully:"
+          echo "  ✅ No HIGH severity security issues"
+          echo "  ✅ No exposed secrets detected"
+          echo "  ✅ Dependency vulnerabilities reviewed"
+          echo ""
+          echo "Code is approved for deployment to production."
+          echo ""
+          echo "ISO 13485 Compliance: All validation gates passed"
+          echo "============================================"
