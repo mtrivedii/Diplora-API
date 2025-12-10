@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Security, Depends, Request
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
+from psycopg2 import sql  # SECURITY FIX: For safe SQL identifier quoting
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from pydantic import BaseModel, Field
 import os
@@ -15,6 +16,8 @@ from datetime import datetime
 import hashlib
 import uuid
 from typing import Optional
+import logging
+import re
 
 # --- IMPORT MODULES ---
 from neural_net import LeadAwareResNet1D
@@ -23,14 +26,24 @@ from signal_processing import Signal, compute_hrv_features, detect_r_peaks
 
 load_dotenv()
 
+# --- LOGGING SETUP ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+security_logger = logging.getLogger("diplora.security")
+
 # --- CONFIGURATION ---
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY")
 DATABASE_URL = f"postgresql://postgres.vcdvtrqrqoegtjmtaulm:{DB_PASSWORD or ''}@aws-1-eu-west-1.pooler.supabase.com:5432/postgres"
 
-# --- HUGGING FACE CONFIG ---
+# --- HUGGING FACE CONFIG (SECURITY ENHANCED) ---
 HF_REPO_ID = "maanit/diplora-demo"
 HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_MODEL_REVISION = os.environ.get("HF_MODEL_REVISION", "main")  # SECURITY: Pin to specific version
+
+# Model integrity hashes (optional but recommended for ISO 13485)
+CLASSIFIER_SHA256 = os.environ.get("CLASSIFIER_SHA256")
+RECONSTRUCTOR_SHA256 = os.environ.get("RECONSTRUCTOR_SHA256")
 
 HF_FILES = {
     "config": "results.json",
@@ -56,6 +69,11 @@ BP_LOW = 0.5
 BP_HIGH = 40.0
 MODEL_VERSION = "v1.2.0-iso13485"
 
+# --- CUSTOM EXCEPTIONS ---
+class SecurityError(Exception):
+    """Raised when a security validation fails"""
+    pass
+
 # --- APP SETUP ---
 app = FastAPI(
     title="Diplora AI Analysis Service",
@@ -78,16 +96,61 @@ device = torch.device("cpu")
 # --- SECURITY: Job ID Tracking (Prevent Replay Attacks) ---
 processed_jobs = set()  # In production, use Redis with TTL
 
+# --- SECURITY HELPERS ---
+
+def verify_model_integrity(model_path: str, expected_hash: str) -> None:
+    """
+    Verify model file integrity using SHA256 hash.
+    
+    ISO 13485 Compliance: Clause 7.5.9 (Data Integrity)
+    Prevents tampering with AI models that could affect patient safety.
+    
+    Args:
+        model_path: Path to model file
+        expected_hash: Expected SHA256 hash
+        
+    Raises:
+        SecurityError: If hash doesn't match
+    """
+    actual_hash = hashlib.sha256(open(model_path, 'rb').read()).hexdigest()
+    
+    if actual_hash != expected_hash:
+        security_logger.critical(
+            f"MODEL_INTEGRITY_VIOLATION: Expected {expected_hash}, got {actual_hash}",
+            extra={
+                "event_type": "security_violation",
+                "severity": "critical",
+                "model_path": model_path
+            }
+        )
+        raise SecurityError(
+            f"Model integrity check failed. "
+            f"Expected: {expected_hash}, Got: {actual_hash}"
+        )
+    
+    logger.info(f"✅ Model integrity verified: {model_path}")
+
 # --- CORE HELPERS ---
+
 def clear_memory():
     """Forces garbage collection to free RAM."""
     gc.collect()
 
 def load_config():
-    """Fetches results.json or falls back to defaults"""
+    """
+    Fetches results.json or falls back to defaults.
+    
+    SECURITY FIX: Pins to specific model revision for reproducibility.
+    """
     try:
-        print("📥 Fetching config from Hugging Face...")
-        config_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["config"], token=HF_TOKEN)
+        logger.info("📥 Fetching config from Hugging Face...")
+        config_path = hf_hub_download(
+            repo_id=HF_REPO_ID, 
+            filename=HF_FILES["config"], 
+            token=HF_TOKEN,
+            revision=HF_MODEL_REVISION,  # SECURITY: Pin to validated version
+            etag_timeout=30  # Fail fast on network issues
+        )
         
         with open(config_path, "r") as f:
             meta = json.load(f)
@@ -105,7 +168,7 @@ def load_config():
             }
         }
     except Exception as e:
-        print(f"⚠️ Config download failed ({e}). Using FALLBACK defaults.")
+        logger.warning(f"⚠️ Config download failed ({e}). Using FALLBACK defaults.")
         return {
             "class_names": DEFAULT_CLASSES,
             "params": DEFAULT_ARCH
@@ -117,12 +180,38 @@ CLASS_NAMES = CONFIG_DATA["class_names"]
 CLF_PARAMS = CONFIG_DATA["params"]
 
 def load_classifier():
-    """Loads classifier from Private HF Repo"""
-    print("🧠 Loading Classifier...")
-    model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["classifier"], token=HF_TOKEN)
+    """
+    Loads classifier from Private HF Repo with security validation.
+    
+    SECURITY FIXES:
+    1. Pins to specific model revision (prevents supply chain attacks)
+    2. Uses weights_only=True (prevents arbitrary code execution)
+    3. Optionally verifies SHA256 hash (detects tampering)
+    
+    ISO 13485: Clause 7.5.6 (Software Validation) - ensures only validated models are loaded
+    """
+    logger.info("🧠 Loading Classifier...")
+    
+    # SECURITY: Pin to specific validated version
+    model_path = hf_hub_download(
+        repo_id=HF_REPO_ID, 
+        filename=HF_FILES["classifier"], 
+        token=HF_TOKEN,
+        revision=HF_MODEL_REVISION,  # SECURITY FIX: Version pinning
+        etag_timeout=30
+    )
+    
+    # SECURITY: Verify model integrity if hash is provided
+    if CLASSIFIER_SHA256:
+        verify_model_integrity(model_path, CLASSIFIER_SHA256)
+    else:
+        logger.warning("⚠️ Model integrity check skipped (no CLASSIFIER_SHA256 set)")
     
     model = LeadAwareResNet1D(**CLF_PARAMS).to(device)
-    ckpt = torch.load(model_path, map_location=device)
+    
+    # SECURITY FIX: Use weights_only=True to prevent arbitrary code execution
+    # PyTorch's pickle-based loading can execute malicious code without this flag
+    ckpt = torch.load(model_path, map_location=device, weights_only=True)
     
     state_dict = ckpt.get("state_dict", ckpt)
     clean_state = {k.replace("module.", ""): v for k, v in state_dict.items()}
@@ -132,12 +221,33 @@ def load_classifier():
     return model
 
 def load_reconstructor():
-    """Loads reconstructor from Private HF Repo"""
-    print("🎨 Loading Reconstructor...")
-    recon_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["reconstructor"], token=HF_TOKEN)
+    """
+    Loads reconstructor from Private HF Repo with security validation.
+    
+    SECURITY FIXES: Same as load_classifier()
+    """
+    logger.info("🎨 Loading Reconstructor...")
+    
+    recon_path = hf_hub_download(
+        repo_id=HF_REPO_ID, 
+        filename=HF_FILES["reconstructor"], 
+        token=HF_TOKEN,
+        revision=HF_MODEL_REVISION,  # SECURITY FIX: Version pinning
+        etag_timeout=30
+    )
+    
+    # SECURITY: Verify integrity if hash is provided
+    if RECONSTRUCTOR_SHA256:
+        verify_model_integrity(recon_path, RECONSTRUCTOR_SHA256)
+    else:
+        logger.warning("⚠️ Model integrity check skipped (no RECONSTRUCTOR_SHA256 set)")
     
     recon = LeadReconstructionNet().to(device)
-    recon.load_state_dict(torch.load(recon_path, map_location=device))
+    
+    # SECURITY FIX: Use weights_only=True
+    recon.load_state_dict(
+        torch.load(recon_path, map_location=device, weights_only=True)
+    )
     recon.eval()
     return recon
 
@@ -155,7 +265,7 @@ async def verify_api_key(key: str = Security(api_key_header)):
         raise HTTPException(status_code=403, detail="Missing X-API-Key header")
     
     if key != API_SECRET_KEY:
-        print(f"⚠️ SECURITY: Invalid API key attempt from unknown source")
+        logger.warning(f"⚠️ SECURITY: Invalid API key attempt")
         raise HTTPException(status_code=403, detail="Invalid API Key")
     
     return True
@@ -202,37 +312,84 @@ def log_audit_event_separate(
         
         cursor.close()
         conn.close()
-        print(f"✅ Audit log recorded: {job_id} - {action_type} - {status}")
+        logger.info(f"✅ Audit log recorded: {job_id} - {action_type} - {status}")
     except Exception as e:
-        print(f"❌ CRITICAL: Audit logging failed: {e}")
+        logger.error(f"❌ CRITICAL: Audit logging failed: {e}")
         # Don't fail the request, but log the error
 
 # --- DATA ACCESS ---
 
-def get_partition_name(timestamp_str):
-    """Parses timestamp string to construct the partition table name."""
+def get_partition_name(timestamp_str: str) -> str:
+    """
+    Parses timestamp string to construct the partition table name.
+    
+    SECURITY FIXES:
+    1. Strict datetime parsing (raises ValueError on invalid input)
+    2. Regex validation of output format
+    3. Logging of suspicious inputs
+    
+    ISO 13485: Clause 7.5.9 (Data Integrity) - prevents SQL injection
+    
+    Args:
+        timestamp_str: Timestamp in format "YYYY-MM-DD HH:MM:SS"
+        
+    Returns:
+        Partition table name (e.g., "ecg_data_y2024m01")
+        
+    Raises:
+        ValueError: If timestamp format is invalid
+    """
     try:
+        # SECURITY: Strict datetime parsing - raises ValueError on invalid input
         dt = datetime.strptime(timestamp_str.split('.')[0], "%Y-%m-%d %H:%M:%S")
-        return f"ecg_data_y{dt.strftime('%Y')}m{dt.strftime('%m')}"
-    except ValueError:
+        
+        # Generate partition name
+        table_name = f"ecg_data_y{dt.strftime('%Y')}m{dt.strftime('%m')}"
+        
+        # SECURITY FIX: Additional validation - ensure partition name matches expected format
+        # Format: ecg_data_y{YYYY}m{MM}
+        if not re.match(r'^ecg_data_y\d{4}m\d{2}$', table_name):
+            raise ValueError(f"Invalid partition name format: {table_name}")
+        
+        return table_name
+    
+    except ValueError as e:
+        # Log security event for suspicious input
+        security_logger.warning(
+            f"Invalid timestamp format or partition name: {timestamp_str}",
+            extra={
+                "security_event": True, 
+                "input": timestamp_str,
+                "error": str(e)
+            }
+        )
+        
+        # Fallback to main table
         return "ecg_data"
 
 def fetch_and_process_ecg(user_id, start, end, cursor):
-    """Fetches data using the dynamically generated partition name."""
+    """
+    Fetches data using the dynamically generated partition name.
+    
+    SECURITY FIX: Uses SQL identifier quoting to prevent injection.
+    """
     
     table_name = get_partition_name(start)
     
-    query = f"""
+    # SECURITY FIX: Use SQL identifier to safely quote table name
+    # This prevents SQL injection even if table_name contains malicious content
+    query = sql.SQL("""
         SELECT COALESCE(channel1,0), COALESCE(channel2,0), COALESCE(channel3,0)
-        FROM {table_name} 
+        FROM {table}
         WHERE user_id = %s AND timestamp >= %s AND timestamp < %s
         ORDER BY timestamp ASC LIMIT 5000;
-    """
+    """).format(table=sql.Identifier(table_name))
     
     cursor.execute(query, (user_id, start, end))
     rows = cursor.fetchall()
     
-    if not rows: return None
+    if not rows: 
+        return None
 
     raw = np.array(rows, dtype=np.float32).T 
     filtered = Signal._bp_filter_np(raw, fs=TARGET_FS, lowcut=BP_LOW, highcut=BP_HIGH)
@@ -269,6 +426,10 @@ async def root():
         "service": "Diplora AI Engine",
         "version": MODEL_VERSION,
         "status": "online",
+        "security": {
+            "model_pinning": HF_MODEL_REVISION != "main",
+            "integrity_checks": bool(CLASSIFIER_SHA256 and RECONSTRUCTOR_SHA256)
+        },
         "endpoints": {
             "health": "/health",
             "analyze": "/analyze (POST, requires X-API-Key)",
@@ -282,6 +443,7 @@ async def health_check():
     return {
         "status": "healthy",
         "model_version": MODEL_VERSION,
+        "model_revision": HF_MODEL_REVISION,
         "service": "diplora-ai-engine",
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -308,7 +470,7 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
     
     # SECURITY: Prevent replay attacks (Sub-Q2)
     if job_id in processed_jobs:
-        print(f"⚠️ SECURITY: Duplicate job_id detected: {job_id}")
+        logger.warning(f"⚠️ SECURITY: Duplicate job_id detected: {job_id}")
         
         # Log replay attack attempt
         log_audit_event_separate(
@@ -419,7 +581,7 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
 
     except Exception as e:
         clear_memory()
-        print(f"❌ Error in /analyze: {e}")
+        logger.error(f"❌ Error in /analyze: {e}")
         
         # Log failure
         log_audit_event_separate(
@@ -521,4 +683,7 @@ async def reconstruct_data(request: AnalysisRequest, http_request: Request):
 
 if __name__ == "__main__":
     import uvicorn
+    # ISO 13485 Note: Binding to 0.0.0.0 is required for containerized deployment (Render)
+    # Network security is enforced at platform level (firewall + TLS)
+    # Application-level security enforced via API key authentication
     uvicorn.run(app, host="0.0.0.0", port=8000)

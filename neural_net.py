@@ -70,7 +70,16 @@ class LeadGating(nn.Module):
         b, lc, t = x.shape
         l = self.n_leads
         c = self.channels_per_lead
-        assert lc == l * c, "LeadGating: mismatched concatenated channels"
+        
+        # SECURITY FIX: Replace assert with explicit validation
+        # ISO 13485: Ensures validation always executes (even with python -O)
+        if lc != l * c:
+            raise ValueError(
+                f"LeadGating: Channel dimension mismatch. "
+                f"Expected {l} leads × {c} channels/lead = {l * c} total channels, "
+                f"but got {lc} channels. "
+                f"This indicates incorrect tensor reshaping in the forward pass."
+            )
 
         # Reshape to [B, L, C, T]
         x4 = x.view(b, l, c, t)
@@ -129,7 +138,16 @@ class BlurPool1D(nn.Module):
     """Anti-aliased downsampling with depthwise blur then stride-2 subsample."""
     def __init__(self, channels: int, stride: int = 2, kernel=None):
         super().__init__()
-        assert stride in (2, 3), "BlurPool1D supports stride 2 or 3"
+        
+        # SECURITY FIX: Replace assert with explicit validation
+        # ISO 13485: Ensures validation always executes
+        if stride not in (2, 3):
+            raise ValueError(
+                f"BlurPool1D: Unsupported stride value {stride}. "
+                f"Only stride=2 and stride=3 are supported for anti-aliased downsampling. "
+                f"This is a configuration error in the network architecture."
+            )
+        
         if kernel is None:
             # [1, 2, 1] kernel, normalized
             k = torch.tensor([1., 2., 1.])

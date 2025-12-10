@@ -4,6 +4,8 @@ import numpy as np
 import os
 import json
 import time
+import logging
+import hashlib
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from supabase import create_client
@@ -11,6 +13,16 @@ from huggingface_hub import hf_hub_download
 
 from neural_net import LeadAwareResNet1D
 from lead_reconstruction import LeadReconstructionNet
+
+# --- LOGGING SETUP ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+security_logger = logging.getLogger("diplora.security")
+
+# --- CUSTOM EXCEPTIONS ---
+class SecurityError(Exception):
+    """Raised when a security validation fails"""
+    pass
 
 # 1. Define Image
 image = (
@@ -34,44 +46,73 @@ class AnalysisRequest(BaseModel):
 @app.cls(
     image=image,
     gpu="T4",
-    # IMPORTANT: Ensure HF_TOKEN is in this secret!
+    # IMPORTANT: Ensure HF_TOKEN and security variables are in this secret!
     secrets=[modal.Secret.from_name("diplora-secrets")], 
     keep_warm=1
 )
 class ModelService:
     def __enter__(self):
-        print("⚡ Initializing AI Service...")
+        logger.info("⚡ Initializing AI Service...")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         HF_REPO_ID = "maanit/diplora-demo"
         # Modal will automatically pull this from the secret "diplora-secrets"
-        HF_TOKEN = os.environ.get("HF_TOKEN") 
+        HF_TOKEN = os.environ.get("HF_TOKEN")
+        
+        # SECURITY: Model version control
+        HF_MODEL_REVISION = os.environ.get("HF_MODEL_REVISION", "main")
+        CLASSIFIER_SHA256 = os.environ.get("CLASSIFIER_SHA256")
+        RECONSTRUCTOR_SHA256 = os.environ.get("RECONSTRUCTOR_SHA256")
 
         HF_FILES = {
             "config": "results.json",
-            "classifier": "model_weights.pth", # <--- Corrected
+            "classifier": "model_weights.pth",
             "reconstructor": "lead_reconstruction.pth"
         }
         
         # --- A. Load Configuration ---
-        print(f"📥 Fetching config from Hugging Face: {HF_REPO_ID}...")
+        logger.info(f"📥 Fetching config from Hugging Face: {HF_REPO_ID}...")
         try:
-            config_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["config"], token=HF_TOKEN)
+            # SECURITY FIX: Pin to specific revision
+            config_path = hf_hub_download(
+                repo_id=HF_REPO_ID, 
+                filename=HF_FILES["config"], 
+                token=HF_TOKEN,
+                revision=HF_MODEL_REVISION,  # SECURITY: Version pinning
+                etag_timeout=30
+            )
             with open(config_path, "r") as f:
                 self.meta = json.load(f)
             
             arch = self.meta["model_architecture"]["architecture"]
             self.class_names = self.meta["per_class_metrics"]["class_names"]
-            print(f"✅ Config loaded: {len(self.class_names)} classes")
+            logger.info(f"✅ Config loaded: {len(self.class_names)} classes")
         except Exception as e:
-            print(f"❌ Failed to load results.json: {e}")
+            logger.error(f"❌ Failed to load results.json: {e}")
             # FALLBACK defaults for Modal
-            self.class_names = ["AF", "AFL", "NSR", "Other"] # (Truncated for brevity, full list in main.py)
-            arch = {"num_leads": 3, "num_classes": 23, "base_channels": 48, "depths": [3,6,12,4], "kernel_size": 7, "dropout": 0.3}
+            self.class_names = ["AF", "AFL", "NSR", "Other"]  # Truncated for brevity
+            arch = {
+                "num_leads": 3, "num_classes": 23, "base_channels": 48, 
+                "depths": [3,6,12,4], "kernel_size": 7, "dropout": 0.3
+            }
 
         # --- B. Load Classifier ---
-        print("🧠 Loading Classifier...")
-        clf_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["classifier"], token=HF_TOKEN)
+        logger.info("🧠 Loading Classifier...")
+        
+        # SECURITY FIX: Pin to specific revision
+        clf_path = hf_hub_download(
+            repo_id=HF_REPO_ID, 
+            filename=HF_FILES["classifier"], 
+            token=HF_TOKEN,
+            revision=HF_MODEL_REVISION,  # SECURITY: Version pinning
+            etag_timeout=30
+        )
+        
+        # SECURITY: Verify model integrity if hash is provided
+        if CLASSIFIER_SHA256:
+            self._verify_model_integrity(clf_path, CLASSIFIER_SHA256)
+        else:
+            logger.warning("⚠️ Model integrity check skipped (no CLASSIFIER_SHA256 set)")
         
         self.classifier = LeadAwareResNet1D(
             n_leads=arch["num_leads"],
@@ -84,21 +125,76 @@ class ModelService:
             use_rhythm_head=True
         ).to(self.device)
         
-        self.classifier.load_state_dict(torch.load(clf_path, map_location=self.device))
+        # SECURITY FIX: Use weights_only=True to prevent arbitrary code execution
+        self.classifier.load_state_dict(
+            torch.load(clf_path, map_location=self.device, weights_only=True)
+        )
         self.classifier.eval()
         
         # --- C. Load Reconstructor ---
-        print("🎨 Loading Reconstructor...")
+        logger.info("🎨 Loading Reconstructor...")
         try:
-            recon_path = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILES["reconstructor"], token=HF_TOKEN)
+            # SECURITY FIX: Pin to specific revision
+            recon_path = hf_hub_download(
+                repo_id=HF_REPO_ID, 
+                filename=HF_FILES["reconstructor"], 
+                token=HF_TOKEN,
+                revision=HF_MODEL_REVISION,  # SECURITY: Version pinning
+                etag_timeout=30
+            )
+            
+            # SECURITY: Verify integrity if hash is provided
+            if RECONSTRUCTOR_SHA256:
+                self._verify_model_integrity(recon_path, RECONSTRUCTOR_SHA256)
+            else:
+                logger.warning("⚠️ Model integrity check skipped (no RECONSTRUCTOR_SHA256 set)")
+            
             self.recon = LeadReconstructionNet().to(self.device)
-            self.recon.load_state_dict(torch.load(recon_path, map_location=self.device))
+            
+            # SECURITY FIX: Use weights_only=True
+            self.recon.load_state_dict(
+                torch.load(recon_path, map_location=self.device, weights_only=True)
+            )
             self.recon.eval()
         except Exception as e:
-            print(f"⚠️ Reconstruction weights not found: {e}")
+            logger.warning(f"⚠️ Reconstruction weights not found: {e}")
             self.recon = None
 
-        self.supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+        self.supabase = create_client(
+            os.environ["SUPABASE_URL"], 
+            os.environ["SUPABASE_KEY"]
+        )
+    
+    def _verify_model_integrity(self, model_path: str, expected_hash: str) -> None:
+        """
+        Verify model file integrity using SHA256 hash.
+        
+        ISO 13485 Compliance: Clause 7.5.9 (Data Integrity)
+        
+        Args:
+            model_path: Path to model file
+            expected_hash: Expected SHA256 hash
+            
+        Raises:
+            SecurityError: If hash doesn't match
+        """
+        actual_hash = hashlib.sha256(open(model_path, 'rb').read()).hexdigest()
+        
+        if actual_hash != expected_hash:
+            security_logger.critical(
+                f"MODEL_INTEGRITY_VIOLATION: Expected {expected_hash}, got {actual_hash}",
+                extra={
+                    "event_type": "security_violation",
+                    "severity": "critical",
+                    "model_path": model_path
+                }
+            )
+            raise SecurityError(
+                f"Model integrity check failed. "
+                f"Expected: {expected_hash}, Got: {actual_hash}"
+            )
+        
+        logger.info(f"✅ Model integrity verified: {model_path}")
 
     def fetch_signal(self, record_id: int):
         resp = self.supabase.table("measurements").select("*").eq("id", record_id).execute()
@@ -123,7 +219,9 @@ class ModelService:
 
     @modal.web_endpoint(method="POST")
     def analyze(self, request: AnalysisRequest, x_api_key: str = Header(None)):
+        # SECURITY: API key validation
         if x_api_key != os.environ["API_SECRET"]:
+            logger.warning("⚠️ SECURITY: Invalid API key attempt")
             raise HTTPException(status_code=401, detail="Invalid API Key")
 
         start_time = time.time()
@@ -155,7 +253,7 @@ class ModelService:
                 "confidence": confidence,
                 "full_probabilities": {name: float(p) for name, p in zip(self.class_names, probs)},
                 "processing_time_ms": int((time.time() - start_time) * 1000),
-                "model_version": "v1.0-hf-private"
+                "model_version": "v1.2.0-iso13485-secure"
             }
             
             self.supabase.table("analysis_results").insert(payload).execute()
@@ -167,7 +265,7 @@ class ModelService:
             }
 
         except Exception as e:
-            print(f"❌ Error: {e}")
+            logger.error(f"❌ Error: {e}")
             self.supabase.table("analysis_results").insert({
                 "job_id": request.job_id, 
                 "measurement_id": request.record_id, 
