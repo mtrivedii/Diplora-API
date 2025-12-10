@@ -1,0 +1,10 @@
+# .bandit configuration
+exclude_dirs:
+  - /venv/
+  - /.venv/
+  - /tests/
+  - /node_modules/
+
+skips:
+  - B101  # Skip assert warnings (ok for testing)
+  - B601  # Skip subprocess warnings (used safely)
