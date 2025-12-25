@@ -1,4 +1,3 @@
-# Move this to the VERY TOP to ensure CPU version is picked
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
 
@@ -9,7 +8,9 @@ psycopg2-binary
 pydantic
 python-dotenv
 requests
-huggingface-hub
+
+# Supabase Python Client (NEW)
+supabase
 
 # Math & Signal Processing
 numpy
