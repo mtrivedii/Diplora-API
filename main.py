@@ -1,8 +1,9 @@
+
 from fastapi import FastAPI, HTTPException, Security, Depends, Request
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
-from psycopg2 import sql  # SECURITY FIX: For safe SQL identifier quoting
+from psycopg2 import sql
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from pydantic import BaseModel, Field
 import os
@@ -11,13 +12,14 @@ import numpy as np
 import torch
 import gc 
 from dotenv import load_dotenv
-from huggingface_hub import hf_hub_download
 from datetime import datetime
 import hashlib
 import uuid
 from typing import Optional
 import logging
 import re
+from pathlib import Path
+from supabase import create_client
 
 # --- IMPORT MODULES ---
 from neural_net import LeadAwareResNet1D
@@ -36,20 +38,23 @@ DB_PASSWORD = os.environ.get("DB_PASSWORD")
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY")
 DATABASE_URL = f"postgresql://postgres.vcdvtrqrqoegtjmtaulm:{DB_PASSWORD or ''}@aws-1-eu-west-1.pooler.supabase.com:5432/postgres"
 
-# --- HUGGING FACE CONFIG (SECURITY ENHANCED) ---
-HF_REPO_ID = "maanit/diplora-demo"
-HF_TOKEN = os.environ.get("HF_TOKEN")
-HF_MODEL_REVISION = os.environ.get("HF_MODEL_REVISION", "main")  # SECURITY: Pin to specific version
+# --- SUPABASE STORAGE CONFIG (NEW) ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # Service role key
+STORAGE_BUCKET = "ai-models"
 
-# Model integrity hashes (optional but recommended for ISO 13485)
+# Model paths in Supabase Storage
+CLASSIFIER_STORAGE_PATH = os.environ.get("CLASSIFIER_STORAGE_PATH", "v3fa36f63/model_weights.pth")
+RECONSTRUCTOR_STORAGE_PATH = os.environ.get("RECONSTRUCTOR_STORAGE_PATH", "v3fa36f63/lead_reconstruction.pth")
+CONFIG_STORAGE_PATH = os.environ.get("CONFIG_STORAGE_PATH", "v3fa36f63/results.json")
+
+# Model integrity hashes (REQUIRED for ISO 13485)
 CLASSIFIER_SHA256 = os.environ.get("CLASSIFIER_SHA256")
 RECONSTRUCTOR_SHA256 = os.environ.get("RECONSTRUCTOR_SHA256")
 
-HF_FILES = {
-    "config": "results.json",
-    "classifier": "model_weights.pth",
-    "reconstructor": "lead_reconstruction.pth"
-}
+# Local cache directory (Render has /tmp available)
+CACHE_DIR = Path("/tmp/diplora_models")
+CACHE_DIR.mkdir(exist_ok=True)
 
 # --- FALLBACK CONFIG ---
 DEFAULT_ARCH = {
@@ -67,7 +72,7 @@ DEFAULT_CLASSES = [
 TARGET_FS = 500.0
 BP_LOW = 0.5
 BP_HIGH = 40.0
-MODEL_VERSION = "v1.2.0-iso13485"
+MODEL_VERSION = "v1.3.0-supabase-storage"
 
 # --- CUSTOM EXCEPTIONS ---
 class SecurityError(Exception):
@@ -81,10 +86,10 @@ app = FastAPI(
     version=MODEL_VERSION
 )
 
-# CORS (restrict in production)
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all for testing
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
@@ -93,8 +98,20 @@ app.add_middleware(
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 device = torch.device("cpu")
 
-# --- SECURITY: Job ID Tracking (Prevent Replay Attacks) ---
-processed_jobs = set()  # In production, use Redis with TTL
+# --- SECURITY: Job ID Tracking ---
+processed_jobs = set()
+
+# --- SUPABASE CLIENT (NEW) ---
+supabase_client = None
+
+def get_supabase_client():
+    """Initialize Supabase client (singleton pattern)."""
+    global supabase_client
+    if supabase_client is None:
+        logger.info("🔑 Initializing Supabase client...")
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("✅ Supabase client ready")
+    return supabase_client
 
 # --- SECURITY HELPERS ---
 
@@ -103,14 +120,6 @@ def verify_model_integrity(model_path: str, expected_hash: str) -> None:
     Verify model file integrity using SHA256 hash.
     
     ISO 13485 Compliance: Clause 7.5.9 (Data Integrity)
-    Prevents tampering with AI models that could affect patient safety.
-    
-    Args:
-        model_path: Path to model file
-        expected_hash: Expected SHA256 hash
-        
-    Raises:
-        SecurityError: If hash doesn't match
     """
     actual_hash = hashlib.sha256(open(model_path, 'rb').read()).hexdigest()
     
@@ -130,6 +139,43 @@ def verify_model_integrity(model_path: str, expected_hash: str) -> None:
     
     logger.info(f"✅ Model integrity verified: {model_path}")
 
+def download_from_supabase(storage_path: str, local_filename: str) -> str:
+    """
+    Download file from Supabase Storage to local cache.
+    
+    Args:
+        storage_path: Path in Supabase Storage (e.g., "v3fa36f63/model_weights.pth")
+        local_filename: Filename to save locally (e.g., "classifier.pth")
+    
+    Returns:
+        Local file path
+    """
+    local_path = CACHE_DIR / local_filename
+    
+    # Check if already cached
+    if local_path.exists():
+        logger.info(f"✅ Using cached model: {local_path}")
+        return str(local_path)
+    
+    logger.info(f"📥 Downloading from Supabase Storage: {storage_path}")
+    
+    try:
+        supabase = get_supabase_client()
+        
+        # Download file
+        response = supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
+        
+        # Save to local cache
+        with open(local_path, "wb") as f:
+            f.write(response)
+        
+        logger.info(f"✅ Downloaded to: {local_path} ({len(response):,} bytes)")
+        return str(local_path)
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to download {storage_path}: {e}")
+        raise RuntimeError(f"Model download failed: {e}")
+
 # --- CORE HELPERS ---
 
 def clear_memory():
@@ -138,19 +184,11 @@ def clear_memory():
 
 def load_config():
     """
-    Fetches results.json or falls back to defaults.
-    
-    SECURITY FIX: Pins to specific model revision for reproducibility.
+    Fetches results.json from Supabase Storage or falls back to defaults.
     """
     try:
-        logger.info("📥 Fetching config from Hugging Face...")
-        config_path = hf_hub_download(
-            repo_id=HF_REPO_ID, 
-            filename=HF_FILES["config"], 
-            token=HF_TOKEN,
-            revision=HF_MODEL_REVISION,  # SECURITY: Pin to validated version
-            etag_timeout=30  # Fail fast on network issues
-        )
+        logger.info("📥 Fetching config from Supabase Storage...")
+        config_path = download_from_supabase(CONFIG_STORAGE_PATH, "results.json")
         
         with open(config_path, "r") as f:
             meta = json.load(f)
@@ -181,27 +219,14 @@ CLF_PARAMS = CONFIG_DATA["params"]
 
 def load_classifier():
     """
-    Loads classifier from Private HF Repo with security validation.
-    
-    SECURITY FIXES:
-    1. Pins to specific model revision (prevents supply chain attacks)
-    2. Uses weights_only=True (prevents arbitrary code execution)
-    3. Optionally verifies SHA256 hash (detects tampering)
-    
-    ISO 13485: Clause 7.5.6 (Software Validation) - ensures only validated models are loaded
+    Loads classifier from Supabase Storage with security validation.
     """
-    logger.info("🧠 Loading Classifier...")
+    logger.info("🧠 Loading Classifier from Supabase Storage...")
     
-    # SECURITY: Pin to specific validated version
-    model_path = hf_hub_download(
-        repo_id=HF_REPO_ID, 
-        filename=HF_FILES["classifier"], 
-        token=HF_TOKEN,
-        revision=HF_MODEL_REVISION,  # SECURITY FIX: Version pinning
-        etag_timeout=30
-    )
+    # Download from Supabase
+    model_path = download_from_supabase(CLASSIFIER_STORAGE_PATH, "classifier.pth")
     
-    # SECURITY: Verify model integrity if hash is provided
+    # Verify integrity if hash is provided
     if CLASSIFIER_SHA256:
         verify_model_integrity(model_path, CLASSIFIER_SHA256)
     else:
@@ -209,8 +234,7 @@ def load_classifier():
     
     model = LeadAwareResNet1D(**CLF_PARAMS).to(device)
     
-    # SECURITY FIX: Use weights_only=True to prevent arbitrary code execution
-    # PyTorch's pickle-based loading can execute malicious code without this flag
+    # Load with weights_only for security
     ckpt = torch.load(model_path, map_location=device, weights_only=True)
     
     state_dict = ckpt.get("state_dict", ckpt)
@@ -218,25 +242,19 @@ def load_classifier():
     
     model.load_state_dict(clean_state, strict=False)
     model.eval()
+    logger.info("✅ Classifier loaded successfully")
     return model
 
 def load_reconstructor():
     """
-    Loads reconstructor from Private HF Repo with security validation.
-    
-    SECURITY FIXES: Same as load_classifier()
+    Loads reconstructor from Supabase Storage with security validation.
     """
-    logger.info("🎨 Loading Reconstructor...")
+    logger.info("🎨 Loading Reconstructor from Supabase Storage...")
     
-    recon_path = hf_hub_download(
-        repo_id=HF_REPO_ID, 
-        filename=HF_FILES["reconstructor"], 
-        token=HF_TOKEN,
-        revision=HF_MODEL_REVISION,  # SECURITY FIX: Version pinning
-        etag_timeout=30
-    )
+    # Download from Supabase
+    recon_path = download_from_supabase(RECONSTRUCTOR_STORAGE_PATH, "reconstructor.pth")
     
-    # SECURITY: Verify integrity if hash is provided
+    # Verify integrity if hash is provided
     if RECONSTRUCTOR_SHA256:
         verify_model_integrity(recon_path, RECONSTRUCTOR_SHA256)
     else:
@@ -244,20 +262,18 @@ def load_reconstructor():
     
     recon = LeadReconstructionNet().to(device)
     
-    # SECURITY FIX: Use weights_only=True
+    # Load with weights_only for security
     recon.load_state_dict(
         torch.load(recon_path, map_location=device, weights_only=True)
     )
     recon.eval()
+    logger.info("✅ Reconstructor loaded successfully")
     return recon
 
 # --- SECURITY FUNCTIONS ---
 
 async def verify_api_key(key: str = Security(api_key_header)):
-    """
-    API Key verification - CRITICAL FOR ISO 13485
-    Sub-Question 1: Encrypted & authenticated communication
-    """
+    """API Key verification - CRITICAL FOR ISO 13485"""
     if not API_SECRET_KEY:
         raise HTTPException(status_code=500, detail="API_SECRET_KEY not configured")
     
@@ -271,10 +287,7 @@ async def verify_api_key(key: str = Security(api_key_header)):
     return True
 
 def compute_input_hash(user_id: str, start: str, end: str) -> str:
-    """
-    Compute SHA-256 hash of input parameters for audit trail
-    Required for ISO 13485 Clause 7.5.9 (Traceability)
-    """
+    """Compute SHA-256 hash of input parameters for audit trail"""
     input_str = f"{user_id}|{start}|{end}"
     return hashlib.sha256(input_str.encode()).hexdigest()
 
@@ -288,12 +301,8 @@ def log_audit_event_separate(
     request_ip: str,
     error_message: Optional[str] = None
 ):
-    """
-    DELIVERABLE #2: Audit Log Module (Separate Connection)
-    Uses its own connection to avoid transaction issues
-    """
+    """Audit Log Module (Separate Connection)"""
     try:
-        # Use separate connection with autocommit for audit logs
         conn = psycopg2.connect(DATABASE_URL)
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cursor = conn.cursor()
@@ -315,46 +324,21 @@ def log_audit_event_separate(
         logger.info(f"✅ Audit log recorded: {job_id} - {action_type} - {status}")
     except Exception as e:
         logger.error(f"❌ CRITICAL: Audit logging failed: {e}")
-        # Don't fail the request, but log the error
 
 # --- DATA ACCESS ---
 
 def get_partition_name(timestamp_str: str) -> str:
-    """
-    Parses timestamp string to construct the partition table name.
-    
-    SECURITY FIXES:
-    1. Strict datetime parsing (raises ValueError on invalid input)
-    2. Regex validation of output format
-    3. Logging of suspicious inputs
-    
-    ISO 13485: Clause 7.5.9 (Data Integrity) - prevents SQL injection
-    
-    Args:
-        timestamp_str: Timestamp in format "YYYY-MM-DD HH:MM:SS"
-        
-    Returns:
-        Partition table name (e.g., "ecg_data_y2024m01")
-        
-    Raises:
-        ValueError: If timestamp format is invalid
-    """
+    """Parses timestamp string to construct the partition table name."""
     try:
-        # SECURITY: Strict datetime parsing - raises ValueError on invalid input
         dt = datetime.strptime(timestamp_str.split('.')[0], "%Y-%m-%d %H:%M:%S")
-        
-        # Generate partition name
         table_name = f"ecg_data_y{dt.strftime('%Y')}m{dt.strftime('%m')}"
         
-        # SECURITY FIX: Additional validation - ensure partition name matches expected format
-        # Format: ecg_data_y{YYYY}m{MM}
         if not re.match(r'^ecg_data_y\d{4}m\d{2}$', table_name):
             raise ValueError(f"Invalid partition name format: {table_name}")
         
         return table_name
     
     except ValueError as e:
-        # Log security event for suspicious input
         security_logger.warning(
             f"Invalid timestamp format or partition name: {timestamp_str}",
             extra={
@@ -363,21 +347,12 @@ def get_partition_name(timestamp_str: str) -> str:
                 "error": str(e)
             }
         )
-        
-        # Fallback to main table
         return "ecg_data"
 
 def fetch_and_process_ecg(user_id, start, end, cursor):
-    """
-    Fetches data using the dynamically generated partition name.
-    
-    SECURITY FIX: Uses SQL identifier quoting to prevent injection.
-    """
-    
+    """Fetches data using the dynamically generated partition name."""
     table_name = get_partition_name(start)
     
-    # SECURITY FIX: Use SQL identifier to safely quote table name
-    # This prevents SQL injection even if table_name contains malicious content
     query = sql.SQL("""
         SELECT COALESCE(channel1,0), COALESCE(channel2,0), COALESCE(channel3,0)
         FROM {table}
@@ -398,7 +373,7 @@ def fetch_and_process_ecg(user_id, start, end, cursor):
         filtered = np.concatenate([filtered, pad], axis=1)
     return filtered[:, :5000]
 
-# --- PYDANTIC MODELS (Enhanced Validation) ---
+# --- PYDANTIC MODELS ---
 
 class AnalysisRequest(BaseModel):
     """Enhanced request model with validation"""
@@ -426,8 +401,11 @@ async def root():
         "service": "Diplora AI Engine",
         "version": MODEL_VERSION,
         "status": "online",
+        "storage": {
+            "provider": "Supabase Storage",
+            "bucket": STORAGE_BUCKET
+        },
         "security": {
-            "model_pinning": HF_MODEL_REVISION != "main",
             "integrity_checks": bool(CLASSIFIER_SHA256 and RECONSTRUCTOR_SHA256)
         },
         "endpoints": {
@@ -443,49 +421,31 @@ async def health_check():
     return {
         "status": "healthy",
         "model_version": MODEL_VERSION,
-        "model_revision": HF_MODEL_REVISION,
+        "storage_provider": "Supabase Storage",
         "service": "diplora-ai-engine",
         "timestamp": datetime.utcnow().isoformat()
     }
 
 @app.post("/analyze", dependencies=[Depends(verify_api_key)])
 async def analyze_data(request: AnalysisRequest, http_request: Request):
-    """
-    MAIN ANALYSIS ENDPOINT
-    
-    Security Features (Sub-Q1, Sub-Q2):
-    - API Key validation (X-API-Key header)
-    - Job ID replay attack prevention
-    - Input hash for integrity
-    - Full audit logging
-    
-    ISO 13485 Compliance (Sub-Q3):
-    - Immutable audit logs
-    - Traceability: input → process → output
-    - Error logging
-    """
+    """Main analysis endpoint"""
     job_id = request.job_id
     request_ip = http_request.client.host
     input_hash = compute_input_hash(request.user_id, request.start, request.end)
     
-    # SECURITY: Prevent replay attacks (Sub-Q2)
     if job_id in processed_jobs:
         logger.warning(f"⚠️ SECURITY: Duplicate job_id detected: {job_id}")
-        
-        # Log replay attack attempt
         log_audit_event_separate(
             job_id, request.user_id, "analyze", "failed",
             input_hash, {"reason": "replay_attack"}, request_ip, 
             "Duplicate job_id (replay attack prevented)"
         )
-        
         return {
             "accepted": False, 
             "error": "Duplicate job_id (replay attack prevented)",
             "job_id": job_id
         }
     
-    # Log trigger event (before processing)
     log_audit_event_separate(
         job_id, request.user_id, "trigger", "started",
         input_hash, {}, request_ip
@@ -494,21 +454,16 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
     try:
         clear_memory()
         
-        # Use separate connection for data fetching
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cursor:
-                # Try to fetch ECG data
                 try:
                     signal = fetch_and_process_ecg(request.user_id, request.start, request.end, cursor)
                 except Exception as db_error:
-                    # Database error (table doesn't exist, etc.)
                     error_msg = str(db_error)
-                    
                     log_audit_event_separate(
                         job_id, request.user_id, "analyze", "failed",
                         input_hash, {"error_type": "database"}, request_ip, error_msg
                     )
-                    
                     return {"accepted": False, "error": f"Database error: {error_msg}", "job_id": job_id}
                 
                 if signal is None:
@@ -518,12 +473,10 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
                     )
                     return {"accepted": False, "error": "No data", "job_id": job_id}
 
-                # Features
                 lead_ii = signal[1, :]
                 peaks = detect_r_peaks(lead_ii, fs=TARGET_FS)
                 hrv = compute_hrv_features(peaks, fs=TARGET_FS)
 
-                # Inference
                 clf_model = load_classifier()
                 
                 x = torch.from_numpy(signal).unsqueeze(0).to(device)
@@ -543,7 +496,6 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
                 conf = float(probs[top_idx])
                 all_probs = {CLASS_NAMES[i]: float(p) for i, p in enumerate(probs)}
 
-                # Prepare output
                 output_data = {
                     "type": "classification",
                     "prediction": pred,
@@ -553,7 +505,6 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
                     "r_peaks_count": int(len(peaks))
                 }
 
-                # Store in existing results table
                 cursor.execute(
                     "INSERT INTO ecg_analysis_results (user_id, start_ts, end_ts, metrics, annotations) VALUES (%s, %s, %s, %s, %s) RETURNING id",
                     (request.user_id, request.start, request.end, json.dumps(output_data), json.dumps(list(all_probs.keys())))
@@ -561,10 +512,8 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
                 result_id = cursor.fetchone()[0]
                 conn.commit()
                 
-                # Mark job as processed (replay protection)
                 processed_jobs.add(job_id)
                 
-        # Log successful completion (after everything is done)
         log_audit_event_separate(
             job_id, request.user_id, "analyze", "completed",
             input_hash, output_data, request_ip
@@ -582,20 +531,15 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
     except Exception as e:
         clear_memory()
         logger.error(f"❌ Error in /analyze: {e}")
-        
-        # Log failure
         log_audit_event_separate(
             job_id, request.user_id, "analyze", "failed",
             input_hash, {}, request_ip, str(e)
         )
-        
         return {"accepted": False, "error": str(e), "job_id": job_id}
 
 @app.post("/reconstruct", dependencies=[Depends(verify_api_key)])
 async def reconstruct_data(request: AnalysisRequest, http_request: Request):
-    """
-    12-Lead Reconstruction Endpoint (with audit logging)
-    """
+    """12-Lead Reconstruction Endpoint"""
     job_id = request.job_id
     request_ip = http_request.client.host
     input_hash = compute_input_hash(request.user_id, request.start, request.end)
@@ -678,12 +622,8 @@ async def reconstruct_data(request: AnalysisRequest, http_request: Request):
             job_id, request.user_id, "reconstruct", "failed",
             input_hash, {}, request_ip, str(e)
         )
-        
         return {"accepted": False, "error": str(e), "job_id": job_id}
 
 if __name__ == "__main__":
     import uvicorn
-    # ISO 13485 Note: Binding to 0.0.0.0 is required for containerized deployment (Render)
-    # Network security is enforced at platform level (firewall + TLS)
-    # Application-level security enforced via API key authentication
     uvicorn.run(app, host="0.0.0.0", port=8000)
