@@ -41,9 +41,7 @@ DATABASE_URL = f"postgresql://postgres.vcdvtrqrqoegtjmtaulm:{DB_PASSWORD or ''}@
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # Service role key
 
-# UPDATED: Use your actual bucket name "AI Model Weights"
-STORAGE_BUCKET = os.environ.get("SUPABASE_STORAGE_BUCKET", "AI Model Weights")
-
+STORAGE_BUCKET = "ai-models"
 # UPDATED: Files are in root of bucket (no version folder yet)
 CLASSIFIER_STORAGE_PATH = os.environ.get("CLASSIFIER_STORAGE_PATH", "model_weights.pth")
 RECONSTRUCTOR_STORAGE_PATH = os.environ.get("RECONSTRUCTOR_STORAGE_PATH", "lead_reconstruction.pth")
