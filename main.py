@@ -39,7 +39,7 @@ DATABASE_URL = f"postgresql://postgres.vcdvtrqrqoegtjmtaulm:{DB_PASSWORD or ''}@
 
 # --- SUPABASE STORAGE CONFIG ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # Service role key (not used for public bucket)
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # Service role key
 
 # Bucket configuration
 STORAGE_BUCKET = "ai-models"
@@ -73,7 +73,7 @@ DEFAULT_CLASSES = [
 TARGET_FS = 500.0
 BP_LOW = 0.5
 BP_HIGH = 40.0
-MODEL_VERSION = "v1.3.1-http-storage"
+MODEL_VERSION = "v1.3.2-authenticated-storage"
 
 # --- CUSTOM EXCEPTIONS ---
 class SecurityError(Exception):
@@ -102,12 +102,12 @@ device = torch.device("cpu")
 # --- SECURITY: Job ID Tracking ---
 processed_jobs = set()
 
-# --- STORAGE HELPERS (UPDATED: Direct HTTP API) ---
+# --- STORAGE HELPERS (UPDATED: Authenticated Access) ---
 
 def download_from_supabase(storage_path: str, local_filename: str) -> str:
     """
     Download file from Supabase Storage to local cache.
-    Uses direct HTTP API for better compatibility.
+    Uses authenticated API with service role key.
     
     Args:
         storage_path: Path in Supabase Storage (e.g., "model_weights.pth")
@@ -129,14 +129,20 @@ def download_from_supabase(storage_path: str, local_filename: str) -> str:
     logger.info(f"📥 Downloading from Supabase Storage: {storage_path}")
     
     try:
-        # UPDATED: Use direct HTTP API (more reliable than SDK)
-        # For public buckets, use /storage/v1/object/public/{bucket}/{path}
-        url = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{storage_path}"
+        # UPDATED: Use authenticated endpoint with service role key
+        # For private buckets OR when public doesn't work: /storage/v1/object/authenticated/{bucket}/{path}
+        url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{storage_path}"
         
         logger.info(f"🔗 Download URL: {url}")
         
+        # Add Authorization header with service role key
+        headers = {
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "apikey": SUPABASE_KEY
+        }
+        
         # Download with requests library
-        response = requests.get(url, timeout=60)
+        response = requests.get(url, headers=headers, timeout=60)
         
         if response.status_code != 200:
             raise RuntimeError(
@@ -468,7 +474,7 @@ async def root():
         "version": MODEL_VERSION,
         "status": "online",
         "storage": {
-            "provider": "Supabase Storage (HTTP API)",
+            "provider": "Supabase Storage (Authenticated API)",
             "bucket": STORAGE_BUCKET,
             "classifier": CLASSIFIER_STORAGE_PATH,
             "reconstructor": RECONSTRUCTOR_STORAGE_PATH,
