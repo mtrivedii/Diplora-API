@@ -18,7 +18,7 @@ from typing import Optional
 import logging
 import re
 from pathlib import Path
-from supabase import create_client
+import requests  # For direct HTTP downloads
 
 # --- IMPORT MODULES ---
 from neural_net import LeadAwareResNet1D
@@ -39,10 +39,12 @@ DATABASE_URL = f"postgresql://postgres.vcdvtrqrqoegtjmtaulm:{DB_PASSWORD or ''}@
 
 # --- SUPABASE STORAGE CONFIG ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # Service role key
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # Service role key (not used for public bucket)
 
+# Bucket configuration
 STORAGE_BUCKET = "ai-models"
-# UPDATED: Files are in root of bucket (no version folder yet)
+
+# File paths in bucket
 CLASSIFIER_STORAGE_PATH = os.environ.get("CLASSIFIER_STORAGE_PATH", "model_weights.pth")
 RECONSTRUCTOR_STORAGE_PATH = os.environ.get("RECONSTRUCTOR_STORAGE_PATH", "lead_reconstruction.pth")
 CONFIG_STORAGE_PATH = os.environ.get("CONFIG_STORAGE_PATH", "results.json")
@@ -71,7 +73,7 @@ DEFAULT_CLASSES = [
 TARGET_FS = 500.0
 BP_LOW = 0.5
 BP_HIGH = 40.0
-MODEL_VERSION = "v1.3.0-supabase-storage"
+MODEL_VERSION = "v1.3.1-http-storage"
 
 # --- CUSTOM EXCEPTIONS ---
 class SecurityError(Exception):
@@ -100,17 +102,57 @@ device = torch.device("cpu")
 # --- SECURITY: Job ID Tracking ---
 processed_jobs = set()
 
-# --- SUPABASE CLIENT ---
-supabase_client = None
+# --- STORAGE HELPERS (UPDATED: Direct HTTP API) ---
 
-def get_supabase_client():
-    """Initialize Supabase client (singleton pattern)."""
-    global supabase_client
-    if supabase_client is None:
-        logger.info("🔑 Initializing Supabase client...")
-        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info("✅ Supabase client ready")
-    return supabase_client
+def download_from_supabase(storage_path: str, local_filename: str) -> str:
+    """
+    Download file from Supabase Storage to local cache.
+    Uses direct HTTP API for better compatibility.
+    
+    Args:
+        storage_path: Path in Supabase Storage (e.g., "model_weights.pth")
+        local_filename: Filename to save locally (e.g., "classifier.pth")
+    
+    Returns:
+        Local file path
+        
+    Raises:
+        RuntimeError: If download fails
+    """
+    local_path = CACHE_DIR / local_filename
+    
+    # Check if already cached
+    if local_path.exists():
+        logger.info(f"✅ Using cached model: {local_path}")
+        return str(local_path)
+    
+    logger.info(f"📥 Downloading from Supabase Storage: {storage_path}")
+    
+    try:
+        # UPDATED: Use direct HTTP API (more reliable than SDK)
+        # For public buckets, use /storage/v1/object/public/{bucket}/{path}
+        url = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{storage_path}"
+        
+        logger.info(f"🔗 Download URL: {url}")
+        
+        # Download with requests library
+        response = requests.get(url, timeout=60)
+        
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"HTTP {response.status_code}: {response.text[:200]}"
+            )
+        
+        # Save to local cache
+        with open(local_path, "wb") as f:
+            f.write(response.content)
+        
+        logger.info(f"✅ Downloaded to: {local_path} ({len(response.content):,} bytes)")
+        return str(local_path)
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to download {storage_path}: {e}")
+        raise RuntimeError(f"Model download failed: {e}")
 
 # --- SECURITY HELPERS ---
 
@@ -145,46 +187,6 @@ def verify_model_integrity(model_path: str, expected_hash: str) -> None:
         )
     
     logger.info(f"✅ Model integrity verified: {model_path}")
-
-def download_from_supabase(storage_path: str, local_filename: str) -> str:
-    """
-    Download file from Supabase Storage to local cache.
-    
-    Args:
-        storage_path: Path in Supabase Storage (e.g., "model_weights.pth")
-        local_filename: Filename to save locally (e.g., "classifier.pth")
-    
-    Returns:
-        Local file path
-        
-    Raises:
-        RuntimeError: If download fails
-    """
-    local_path = CACHE_DIR / local_filename
-    
-    # Check if already cached
-    if local_path.exists():
-        logger.info(f"✅ Using cached model: {local_path}")
-        return str(local_path)
-    
-    logger.info(f"📥 Downloading from Supabase Storage: {storage_path}")
-    
-    try:
-        supabase = get_supabase_client()
-        
-        # Download file from bucket
-        response = supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
-        
-        # Save to local cache
-        with open(local_path, "wb") as f:
-            f.write(response)
-        
-        logger.info(f"✅ Downloaded to: {local_path} ({len(response):,} bytes)")
-        return str(local_path)
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to download {storage_path}: {e}")
-        raise RuntimeError(f"Model download failed: {e}")
 
 # --- CORE HELPERS ---
 
@@ -466,7 +468,7 @@ async def root():
         "version": MODEL_VERSION,
         "status": "online",
         "storage": {
-            "provider": "Supabase Storage",
+            "provider": "Supabase Storage (HTTP API)",
             "bucket": STORAGE_BUCKET,
             "classifier": CLASSIFIER_STORAGE_PATH,
             "reconstructor": RECONSTRUCTOR_STORAGE_PATH,
