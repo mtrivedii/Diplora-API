@@ -18,7 +18,7 @@ from typing import Optional
 import logging
 import re
 from pathlib import Path
-import requests  # For direct HTTP downloads
+from supabase import create_client, Client
 
 # --- IMPORT MODULES ---
 from neural_net import LeadAwareResNet1D
@@ -73,7 +73,7 @@ DEFAULT_CLASSES = [
 TARGET_FS = 500.0
 BP_LOW = 0.5
 BP_HIGH = 40.0
-MODEL_VERSION = "v1.3.2-authenticated-storage"
+MODEL_VERSION = "v1.3.3-sdk-storage"
 
 # --- CUSTOM EXCEPTIONS ---
 class SecurityError(Exception):
@@ -102,12 +102,23 @@ device = torch.device("cpu")
 # --- SECURITY: Job ID Tracking ---
 processed_jobs = set()
 
-# --- STORAGE HELPERS (UPDATED: Authenticated Access) ---
+# --- SUPABASE CLIENT (Singleton) ---
+_supabase_client: Optional[Client] = None
+
+def get_supabase_client() -> Client:
+    """Get or create Supabase client (singleton pattern)."""
+    global _supabase_client
+    if _supabase_client is None:
+        logger.info("🔑 Initializing Supabase client...")
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("✅ Supabase client ready")
+    return _supabase_client
+
+# --- STORAGE HELPERS (UPDATED: Use Supabase SDK) ---
 
 def download_from_supabase(storage_path: str, local_filename: str) -> str:
     """
-    Download file from Supabase Storage to local cache.
-    Uses authenticated API with service role key.
+    Download file from Supabase Storage to local cache using SDK.
     
     Args:
         storage_path: Path in Supabase Storage (e.g., "model_weights.pth")
@@ -129,35 +140,26 @@ def download_from_supabase(storage_path: str, local_filename: str) -> str:
     logger.info(f"📥 Downloading from Supabase Storage: {storage_path}")
     
     try:
-        # UPDATED: Use authenticated endpoint with service role key
-        # For private buckets OR when public doesn't work: /storage/v1/object/authenticated/{bucket}/{path}
-        url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{storage_path}"
+        supabase = get_supabase_client()
         
-        logger.info(f"🔗 Download URL: {url}")
+        # UPDATED: Use SDK download method
+        logger.info(f"🔗 Bucket: {STORAGE_BUCKET}, Path: {storage_path}")
         
-        # Add Authorization header with service role key
-        headers = {
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "apikey": SUPABASE_KEY
-        }
-        
-        # Download with requests library
-        response = requests.get(url, headers=headers, timeout=60)
-        
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"HTTP {response.status_code}: {response.text[:200]}"
-            )
+        # Download file content as bytes
+        response = supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
         
         # Save to local cache
         with open(local_path, "wb") as f:
-            f.write(response.content)
+            f.write(response)
         
-        logger.info(f"✅ Downloaded to: {local_path} ({len(response.content):,} bytes)")
+        logger.info(f"✅ Downloaded to: {local_path} ({len(response):,} bytes)")
         return str(local_path)
         
     except Exception as e:
         logger.error(f"❌ Failed to download {storage_path}: {e}")
+        logger.error(f"   Error type: {type(e).__name__}")
+        logger.error(f"   Bucket: {STORAGE_BUCKET}")
+        logger.error(f"   Path: {storage_path}")
         raise RuntimeError(f"Model download failed: {e}")
 
 # --- SECURITY HELPERS ---
@@ -213,6 +215,7 @@ def load_config():
         with open(config_path, "r") as f:
             meta = json.load(f)
             
+        logger.info("✅ Config loaded successfully")
         return {
             "class_names": meta["per_class_metrics"]["class_names"],
             "params": {
@@ -474,7 +477,7 @@ async def root():
         "version": MODEL_VERSION,
         "status": "online",
         "storage": {
-            "provider": "Supabase Storage (Authenticated API)",
+            "provider": "Supabase Storage (Python SDK)",
             "bucket": STORAGE_BUCKET,
             "classifier": CLASSIFIER_STORAGE_PATH,
             "reconstructor": RECONSTRUCTOR_STORAGE_PATH,
