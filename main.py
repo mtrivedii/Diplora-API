@@ -2,7 +2,6 @@ from fastapi import FastAPI, HTTPException, Security, Depends, Request
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
-from psycopg2 import sql
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from pydantic import BaseModel, Field
 import os
@@ -13,10 +12,8 @@ import gc
 from dotenv import load_dotenv
 from datetime import datetime
 import hashlib
-import uuid
 from typing import Optional
 import logging
-import re
 from pathlib import Path
 from supabase import create_client, Client
 
@@ -73,7 +70,7 @@ DEFAULT_CLASSES = [
 TARGET_FS = 500.0
 BP_LOW = 0.5
 BP_HIGH = 40.0
-MODEL_VERSION = "v1.3.3-sdk-storage"
+MODEL_VERSION = "v1.4.0-parent-table"
 
 # --- CUSTOM EXCEPTIONS ---
 class SecurityError(Exception):
@@ -114,7 +111,7 @@ def get_supabase_client() -> Client:
         logger.info("✅ Supabase client ready")
     return _supabase_client
 
-# --- STORAGE HELPERS (UPDATED: Use Supabase SDK) ---
+# --- STORAGE HELPERS ---
 
 def download_from_supabase(storage_path: str, local_filename: str) -> str:
     """
@@ -142,7 +139,6 @@ def download_from_supabase(storage_path: str, local_filename: str) -> str:
     try:
         supabase = get_supabase_client()
         
-        # UPDATED: Use SDK download method
         logger.info(f"🔗 Bucket: {STORAGE_BUCKET}, Path: {storage_path}")
         
         # Download file content as bytes
@@ -170,13 +166,6 @@ def verify_model_integrity(model_path: str, expected_hash: str) -> None:
     
     ISO 13485 Compliance: Clause 7.5.9 (Data Integrity)
     Prevents tampering with AI models that could affect patient safety.
-    
-    Args:
-        model_path: Path to model file
-        expected_hash: Expected SHA256 hash
-        
-    Raises:
-        SecurityError: If hash doesn't match
     """
     actual_hash = hashlib.sha256(open(model_path, 'rb').read()).hexdigest()
     
@@ -205,8 +194,6 @@ def clear_memory():
 def load_config():
     """
     Fetches results.json from Supabase Storage or falls back to defaults.
-    
-    SECURITY FIX: Pins to specific model revision for reproducibility.
     """
     try:
         logger.info("📥 Fetching config from Supabase Storage...")
@@ -243,12 +230,6 @@ CLF_PARAMS = CONFIG_DATA["params"]
 def load_classifier():
     """
     Loads classifier from Supabase Storage with security validation.
-    
-    SECURITY FIXES:
-    1. Uses weights_only=True (prevents arbitrary code execution)
-    2. Optionally verifies SHA256 hash (detects tampering)
-    
-    ISO 13485: Clause 7.5.6 (Software Validation) - ensures only validated models are loaded
     """
     logger.info("🧠 Loading Classifier from Supabase Storage...")
     
@@ -263,8 +244,7 @@ def load_classifier():
     
     model = LeadAwareResNet1D(**CLF_PARAMS).to(device)
     
-    # SECURITY FIX: Use weights_only=True to prevent arbitrary code execution
-    # PyTorch's pickle-based loading can execute malicious code without this flag
+    # SECURITY: Use weights_only=True to prevent arbitrary code execution
     ckpt = torch.load(model_path, map_location=device, weights_only=True)
     
     state_dict = ckpt.get("state_dict", ckpt)
@@ -278,8 +258,6 @@ def load_classifier():
 def load_reconstructor():
     """
     Loads reconstructor from Supabase Storage with security validation.
-    
-    SECURITY FIXES: Same as load_classifier()
     """
     logger.info("🎨 Loading Reconstructor from Supabase Storage...")
     
@@ -294,7 +272,7 @@ def load_reconstructor():
     
     recon = LeadReconstructionNet().to(device)
     
-    # SECURITY FIX: Use weights_only=True
+    # SECURITY: Use weights_only=True
     recon.load_state_dict(
         torch.load(recon_path, map_location=device, weights_only=True)
     )
@@ -307,7 +285,6 @@ def load_reconstructor():
 async def verify_api_key(key: str = Security(api_key_header)):
     """
     API Key verification - CRITICAL FOR ISO 13485
-    Sub-Question 1: Encrypted & authenticated communication
     """
     if not API_SECRET_KEY:
         raise HTTPException(status_code=500, detail="API_SECRET_KEY not configured")
@@ -323,8 +300,8 @@ async def verify_api_key(key: str = Security(api_key_header)):
 
 def compute_input_hash(user_id: str, start: str, end: str) -> str:
     """
-    Compute SHA-256 hash of input parameters for audit trail
-    Required for ISO 13485 Clause 7.5.9 (Traceability)
+    Compute SHA-256 hash of input parameters for audit trail.
+    Required for ISO 13485 Clause 7.5.9 (Traceability).
     """
     input_str = f"{user_id}|{start}|{end}"
     return hashlib.sha256(input_str.encode()).hexdigest()
@@ -340,11 +317,10 @@ def log_audit_event_separate(
     error_message: Optional[str] = None
 ):
     """
-    DELIVERABLE #2: Audit Log Module (Separate Connection)
-    Uses its own connection to avoid transaction issues
+    Audit Log Module - Uses separate connection to avoid transaction issues.
+    ISO 13485 Compliance: Clause 7.5.9 (Traceability).
     """
     try:
-        # Use separate connection with autocommit for audit logs
         conn = psycopg2.connect(DATABASE_URL)
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cursor = conn.cursor()
@@ -366,92 +342,63 @@ def log_audit_event_separate(
         logger.info(f"✅ Audit log recorded: {job_id} - {action_type} - {status}")
     except Exception as e:
         logger.error(f"❌ CRITICAL: Audit logging failed: {e}")
-        # Don't fail the request, but log the error
 
 # --- DATA ACCESS ---
 
-def get_partition_name(timestamp_str: str) -> str:
-    """
-    Parses timestamp string to construct the partition table name.
-    
-    SECURITY FIXES:
-    1. Strict datetime parsing (raises ValueError on invalid input)
-    2. Regex validation of output format
-    3. Logging of suspicious inputs
-    
-    ISO 13485: Clause 7.5.9 (Data Integrity) - prevents SQL injection
-    
-    Args:
-        timestamp_str: Timestamp in format "YYYY-MM-DD HH:MM:SS"
-        
-    Returns:
-        Partition table name (e.g., "ecg_data_y2024m01")
-        
-    Raises:
-        ValueError: If timestamp format is invalid
-    """
-    try:
-        # SECURITY: Strict datetime parsing - raises ValueError on invalid input
-        dt = datetime.strptime(timestamp_str.split('.')[0], "%Y-%m-%d %H:%M:%S")
-        
-        # Generate partition name
-        table_name = f"ecg_data_y{dt.strftime('%Y')}m{dt.strftime('%m')}"
-        
-        # SECURITY FIX: Additional validation - ensure partition name matches expected format
-        if not re.match(r'^ecg_data_y\d{4}m\d{2}$', table_name):
-            raise ValueError(f"Invalid partition name format: {table_name}")
-        
-        return table_name
-    
-    except ValueError as e:
-        # Log security event for suspicious input
-        security_logger.warning(
-            f"Invalid timestamp format or partition name: {timestamp_str}",
-            extra={
-                "security_event": True, 
-                "input": timestamp_str,
-                "error": str(e)
-            }
-        )
-        
-        # Fallback to main table
-        return "ecg_data"
-
 def fetch_and_process_ecg(user_id, start, end, cursor):
     """
-    Fetches data using the dynamically generated partition name.
+    Fetches ECG data from the partitioned ecg_data table.
     
-    SECURITY FIX: Uses SQL identifier quoting to prevent injection.
+    PostgreSQL automatically routes queries to the correct partition
+    based on the timestamp range, so we query the parent table directly.
+    This is simpler and handles queries spanning multiple months.
+    
+    Args:
+        user_id: Patient/user UUID
+        start: Start timestamp (ISO format string)
+        end: End timestamp (ISO format string)
+        cursor: Database cursor
+    
+    Returns:
+        Filtered ECG signal as numpy array [3, 5000] or None if no data
     """
-    
-    table_name = get_partition_name(start)
-    
-    # SECURITY FIX: Use SQL identifier to safely quote table name
-    # This prevents SQL injection even if table_name contains malicious content
-    query = sql.SQL("""
-        SELECT COALESCE(channel1,0), COALESCE(channel2,0), COALESCE(channel3,0)
-        FROM {table}
-        WHERE user_id = %s AND timestamp >= %s AND timestamp < %s
-        ORDER BY timestamp ASC LIMIT 5000;
-    """).format(table=sql.Identifier(table_name))
+    # Query the parent table - PostgreSQL routes to correct partition(s)
+    query = """
+        SELECT COALESCE(channel1, 0), COALESCE(channel2, 0), COALESCE(channel3, 0)
+        FROM ecg_data
+        WHERE user_id = %s 
+          AND timestamp >= %s 
+          AND timestamp < %s
+        ORDER BY timestamp ASC 
+        LIMIT 5000;
+    """
     
     cursor.execute(query, (user_id, start, end))
     rows = cursor.fetchall()
     
-    if not rows: 
+    if not rows:
+        logger.warning(f"No ECG data found for user {user_id} between {start} and {end}")
         return None
+    
+    logger.info(f"📊 Fetched {len(rows)} ECG samples for user {user_id}")
 
-    raw = np.array(rows, dtype=np.float32).T 
+    # Convert to numpy array [3, N] where N is number of samples
+    raw = np.array(rows, dtype=np.float32).T
+    
+    # Apply bandpass filter
     filtered = Signal._bp_filter_np(raw, fs=TARGET_FS, lowcut=BP_LOW, highcut=BP_HIGH)
+    
+    # Pad to 5000 samples if needed (10 seconds at 500 Hz)
     if filtered.shape[1] < 5000:
         pad = np.zeros((3, 5000 - filtered.shape[1]), dtype=np.float32)
         filtered = np.concatenate([filtered, pad], axis=1)
+    
     return filtered[:, :5000]
 
-# --- PYDANTIC MODELS (Enhanced Validation) ---
+# --- PYDANTIC MODELS ---
 
 class AnalysisRequest(BaseModel):
-    """Enhanced request model with validation"""
+    """Request model with validation"""
     job_id: str = Field(..., description="Unique job identifier from Edge Function")
     user_id: str = Field(..., min_length=1, max_length=100)
     start: str = Field(..., description="Start timestamp (ISO format)")
@@ -483,6 +430,10 @@ async def root():
             "reconstructor": RECONSTRUCTOR_STORAGE_PATH,
             "config": CONFIG_STORAGE_PATH
         },
+        "database": {
+            "ecg_table": "ecg_data (partitioned)",
+            "query_mode": "parent table (auto-routing)"
+        },
         "security": {
             "model_pinning": True,
             "integrity_checks": bool(CLASSIFIER_SHA256 and RECONSTRUCTOR_SHA256)
@@ -509,15 +460,15 @@ async def health_check():
 @app.post("/analyze", dependencies=[Depends(verify_api_key)])
 async def analyze_data(request: AnalysisRequest, http_request: Request):
     """
-    MAIN ANALYSIS ENDPOINT
+    Main ECG Analysis Endpoint
     
-    Security Features (Sub-Q1, Sub-Q2):
+    Security Features:
     - API Key validation (X-API-Key header)
     - Job ID replay attack prevention
     - Input hash for integrity
     - Full audit logging
     
-    ISO 13485 Compliance (Sub-Q3):
+    ISO 13485 Compliance:
     - Immutable audit logs
     - Traceability: input → process → output
     - Error logging
@@ -526,11 +477,10 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
     request_ip = http_request.client.host
     input_hash = compute_input_hash(request.user_id, request.start, request.end)
     
-    # SECURITY: Prevent replay attacks (Sub-Q2)
+    # SECURITY: Prevent replay attacks
     if job_id in processed_jobs:
         logger.warning(f"⚠️ SECURITY: Duplicate job_id detected: {job_id}")
         
-        # Log replay attack attempt
         log_audit_event_separate(
             job_id, request.user_id, "analyze", "failed",
             input_hash, {"reason": "replay_attack"}, request_ip, 
@@ -552,14 +502,12 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
     try:
         clear_memory()
         
-        # Use separate connection for data fetching
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cursor:
-                # Try to fetch ECG data
+                # Fetch ECG data
                 try:
                     signal = fetch_and_process_ecg(request.user_id, request.start, request.end, cursor)
                 except Exception as db_error:
-                    # Database error (table doesn't exist, etc.)
                     error_msg = str(db_error)
                     
                     log_audit_event_separate(
@@ -576,12 +524,12 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
                     )
                     return {"accepted": False, "error": "No data", "job_id": job_id}
 
-                # Features
+                # Extract HRV features from Lead II
                 lead_ii = signal[1, :]
                 peaks = detect_r_peaks(lead_ii, fs=TARGET_FS)
                 hrv = compute_hrv_features(peaks, fs=TARGET_FS)
 
-                # Inference
+                # Load model and run inference
                 clf_model = load_classifier()
                 
                 x = torch.from_numpy(signal).unsqueeze(0).to(device)
@@ -611,7 +559,7 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
                     "r_peaks_count": int(len(peaks))
                 }
 
-                # Store in existing results table
+                # Store result
                 cursor.execute(
                     "INSERT INTO ecg_analysis_results (user_id, start_ts, end_ts, metrics, annotations) VALUES (%s, %s, %s, %s, %s) RETURNING id",
                     (request.user_id, request.start, request.end, json.dumps(output_data), json.dumps(list(all_probs.keys())))
@@ -622,7 +570,7 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
                 # Mark job as processed (replay protection)
                 processed_jobs.add(job_id)
                 
-        # Log successful completion (after everything is done)
+        # Log successful completion
         log_audit_event_separate(
             job_id, request.user_id, "analyze", "completed",
             input_hash, output_data, request_ip
@@ -641,7 +589,6 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
         clear_memory()
         logger.error(f"❌ Error in /analyze: {e}")
         
-        # Log failure
         log_audit_event_separate(
             job_id, request.user_id, "analyze", "failed",
             input_hash, {}, request_ip, str(e)
@@ -652,7 +599,9 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
 @app.post("/reconstruct", dependencies=[Depends(verify_api_key)])
 async def reconstruct_data(request: AnalysisRequest, http_request: Request):
     """
-    12-Lead Reconstruction Endpoint (with audit logging)
+    12-Lead ECG Reconstruction Endpoint
+    
+    Reconstructs full 12-lead ECG from 3-lead input using neural network.
     """
     job_id = request.job_id
     request_ip = http_request.client.host
@@ -741,7 +690,5 @@ async def reconstruct_data(request: AnalysisRequest, http_request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    # ISO 13485 Note: Binding to 0.0.0.0 is required for containerized deployment (Render)
-    # Network security is enforced at platform level (firewall + TLS)
-    # Application-level security enforced via API key authentication
+    # Note: Binding to 0.0.0.0 is required for containerized deployment
     uvicorn.run(app, host="0.0.0.0", port=8000)
