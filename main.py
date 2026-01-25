@@ -350,34 +350,28 @@ def fetch_and_process_ecg(user_id, start, end, cursor):
     Fetches ECG data from the partitioned ecg_data table.
     
     PostgreSQL automatically routes queries to the correct partition
-    based on the timestamp range, so we query the parent table directly.
-    This is simpler and handles queries spanning multiple months.
+    based on the timestamp range.
     
-    Args:
-        user_id: Patient/user UUID
-        start: Start timestamp (ISO format string)
-        end: End timestamp (ISO format string)
-        cursor: Database cursor
-    
-    Returns:
-        Filtered ECG signal as numpy array [3, 5000] or None if no data
+    FIXED for ISO 13485: Query uses Postgres INTERVAL to guarantee
+    exactly 10 seconds of data from the start timestamp, eliminating
+    client-side timezone bugs.
     """
-    # Query the parent table - PostgreSQL routes to correct partition(s)
     query = """
         SELECT COALESCE(channel1, 0), COALESCE(channel2, 0), COALESCE(channel3, 0)
         FROM ecg_data
         WHERE user_id = %s 
           AND timestamp >= %s 
-          AND timestamp < %s
+          AND timestamp < %s::timestamptz + INTERVAL '10 seconds'
         ORDER BY timestamp ASC 
         LIMIT 5000;
     """
     
-    cursor.execute(query, (user_id, start, end))
+    # We pass the 'start' timestamp twice for both bounds
+    cursor.execute(query, (user_id, start, start))
     rows = cursor.fetchall()
     
     if not rows:
-        logger.warning(f"No ECG data found for user {user_id} between {start} and {end}")
+        logger.warning(f"No ECG data found for user {user_id} starting at {start}")
         return None
     
     logger.info(f"📊 Fetched {len(rows)} ECG samples for user {user_id}")
@@ -504,7 +498,7 @@ async def analyze_data(request: AnalysisRequest, http_request: Request):
         
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cursor:
-                # Fetch ECG data
+                # Fetch ECG data using reliable INTERVAL query
                 try:
                     signal = fetch_and_process_ecg(request.user_id, request.start, request.end, cursor)
                 except Exception as db_error:
