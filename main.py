@@ -685,4 +685,4 @@ async def reconstruct_data(request: AnalysisRequest, http_request: Request):
 if __name__ == "__main__":
     import uvicorn
     # Note: Binding to 0.0.0.0 is required for containerized deployment
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000) 
