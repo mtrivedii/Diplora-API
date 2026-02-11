@@ -1,27 +1,33 @@
-# Build system (MUST be first)
+# Python 3.11 Compatible Requirements for Diplora AI Engine
+# This file uses only pre-built wheels to avoid compilation issues on Render
+
+# Build system
 setuptools>=68.0.0
 wheel>=0.41.0
 
-# PyTorch with CPU support
-torch==2.10.0 --extra-index-url https://download.pytorch.org/whl/cpu
+# PyTorch (CPU) - use exact version for Python 3.11
+torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
 
-# Web Framework
+# Web Framework (pinned for consistency)
 fastapi==0.104.1
-uvicorn==0.24.0
+uvicorn[standard]==0.24.0
 pydantic==2.12.4
 
 # Database
 psycopg2-binary==2.9.11
+
+# Supabase Python SDK
 supabase==2.24.0
 
-# Environment & Configuration
-python-dotenv==1.0.0
-
-# HTTP Client
+# HTTP & Network
 requests==2.32.4
 httpx==0.28.1
+anyio==4.11.0
 
-# Signal Processing
+# Environment Configuration
+python-dotenv==1.0.0
+
+# Signal Processing (numpy/scipy must be pre-built wheels)
 numpy==1.24.3
 scipy==1.11.4
 PyWavelets==1.5.0
@@ -35,3 +41,4 @@ PyJWT>=2.8.0
 # Utilities
 Jinja2>=3.1.0
 MarkupSafe>=2.1.0
+pydantic-core>=2.0.0
