@@ -10,8 +10,8 @@ psycopg2-binary==2.9.10
 # Deep Learning (ECG analysis only - no vision/audio needed)
 torch==2.5.1
 
-# Scientific Computing
-numpy==2.0.2
+# Scientific Computing (use versions with pre-built wheels for Python 3.13)
+numpy==2.1.0
 scipy==1.14.1
 
 # Utilities
