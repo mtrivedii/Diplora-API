@@ -7,10 +7,8 @@ pydantic==2.10.3
 supabase==2.10.0
 psycopg2-binary==2.9.10
 
-# Deep Learning
+# Deep Learning (ECG analysis only - no vision/audio needed)
 torch==2.5.1
-torchvision==0.20.1
-torchaudio==2.5.1
 
 # Scientific Computing
 numpy==2.0.2
@@ -24,7 +22,7 @@ httpx==0.28.1
 bandit==1.8.0
 safety==3.2.11
 
-# Signal Processing (added for ECG analysis)
+# Signal Processing (for ECG analysis)
 PyWavelets==1.5.0
 filterpy==1.4.2
 tqdm==4.66.1
