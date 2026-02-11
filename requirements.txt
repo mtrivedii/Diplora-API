@@ -16,7 +16,6 @@ scipy==1.14.1
 
 # Utilities
 python-dotenv==1.0.1
-httpx==0.28.1
 
 # Security (for CI/CD)
 bandit==1.8.0
